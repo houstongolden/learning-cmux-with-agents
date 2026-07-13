@@ -4,18 +4,21 @@
 
 The lab deliberately keeps three distinct levels:
 
-1. **Primary orchestrator** — a high-judgment Codex or Claude Code session in
-   the invoking terminal. It talks only to the lead.
+1. **Primary orchestrator** — a high-judgment Codex or Claude Code session
+   booted inside cmux. It talks only to the lead.
 2. **Lead** — a Codex session in the left half of the cmux workspace. It owns
    decomposition, worker routing, result comparison, and the final report.
 3. **Workers** — four named panes in a 2x2 grid. They explore, review, test, and
    independently compare solutions.
 
 cmux is the observable transport. Each agent is a real terminal surface. The
-control loop is `send` text, `send-key enter`, wait for a notification event,
-then `read-screen` to verify the actual result. The spawn receipt records the
-stable window UUID and workspace name; agents rediscover positional surface
-refs immediately before use because refs can renumber.
+normal control loop is `send` text, `send-key enter`, wait for a notification
+event, then `read-screen` to verify the actual result. On this macOS 26.5 host,
+cmux 0.64.17 outside-terminal `send`/`read-screen` repeatedly timed out even
+though workspace creation succeeded. The current safe path is declarative
+startup plus in-cmux control. The spawn receipt records the stable window UUID
+and workspace name; agents rediscover positional surface refs immediately
+before use because refs can renumber.
 
 ## Read-only is the default
 
@@ -81,6 +84,34 @@ For science, the lead should retain disagreement and evidence provenance rather
 than vote by majority. For coding, it can rank candidates by reproduced tests,
 minimal diff, correctness, and maintainability. “Fastest answer” is telemetry,
 not a correctness criterion.
+
+## Mirrored orchestrator A/B
+
+A fair orchestrator comparison uses two clean-room arms. Arm A and arm B receive
+the same immutable task envelope and equivalent fresh lead/worker sessions. The
+lead/worker model routes, prompts, permissions, tools, task text, base SHA,
+dirty-state digest, acceptance commands, and time budget stay fixed. Only the
+orchestrator identity changes.
+
+The same full task is embedded in both orchestrator startup commands,
+eliminating delivery timing and external socket health as confounders. Team
+commands receive the shared envelope path/hash and wait for role-specific
+dispatch; they do not receive the full task at startup. Each arm submits a
+hashed result payload through the sealing helper. The adjudicator waits for both
+submissions, then reveals and scores the results together. The shared envelope
+and spawn receipt contain no plaintext capability token. One arm is
+procedurally forbidden from inspecting the other's plan, transcript, status
+detail, payload, elapsed progress, or preliminary score before it seals its own
+result.
+
+This same-user “capability sealing” is procedural, not an adversarial operating
+system boundary. Result paths are separate and hidden through the helper's
+normal interface, but they are not private from another same-user process.
+Sessions owned by the same macOS user can potentially read the other arm's
+files, processes, cmux surfaces, or You.md messages if prompted to do so. The
+protocol prevents accidental leakage and produces an auditable run;
+hostile-model isolation requires separate OS users, VMs/containers with enforced
+mount/network policy, or a server-side blind evaluation service.
 
 ## Cross-computer evolution
 

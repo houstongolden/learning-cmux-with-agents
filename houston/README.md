@@ -4,10 +4,10 @@ This additive package turns the upstream five-pane cmux pattern into a local
 Codex + Claude Code lab that uses existing ChatGPT and Claude.ai logins. It does
 not load `.env`, require provider API keys, or change upstream files.
 
-The default topology is:
+The default single-arm topology is:
 
 ```text
-primary orchestrator: Codex / gpt-5.6-sol / high (outside the team workspace)
+primary orchestrator: Codex / gpt-5.6-sol / high (inside cmux)
                                 |
                                 v
 +-------------------------------+-------------------------------+
@@ -37,10 +37,29 @@ python3 scripts/spawn_subscription_fleet.py \
   --project feature-or-bug-name
 ```
 
-The live command creates the lead + four-worker cmux workspace and starts the
-primary Codex orchestrator in the invoking terminal. Use
+The live command boots commands declaratively inside cmux. Use
 `--orchestrator none` to create only the team, or `--orchestrator claude` to run
 the comparison orchestrator with Claude Opus 4.8 at high effort.
+
+For a real Codex-versus-Claude comparison, do not point two orchestrators at one
+already-active lead. Create mirrored A and B arms from one immutable task
+envelope. The arms use identical lead/worker models, prompts, permissions,
+repository state, and acceptance checks; only the orchestrator differs. Each
+arm submits through the sealed-results helper, and the adjudicator reveals
+either payload only after both submission receipts exist. See
+[MIRRORED-AB-PROTOCOL.md](MIRRORED-AB-PROTOCOL.md).
+
+```bash
+python3 scripts/spawn_subscription_fleet.py \
+  --repo /absolute/path/to/repo \
+  --project feature-ab \
+  --mirrored \
+  --task-file /absolute/path/to/task.md
+```
+
+The launcher prints the task-envelope and spawn-receipt paths; the sealed root
+is the nested `sealed_results.root` field. The shared envelope and receipt
+contain capability hashes/references, not plaintext submission tokens.
 
 Mutation is currently fail-closed:
 
@@ -62,6 +81,8 @@ lease. The required claim API and isolated-worktree rollout are specified in
   what exists today versus the atomic lease API still needed.
 - [MODEL-MATRIX.md](MODEL-MATRIX.md) — model/effort/permission defaults and
   override examples.
+- [MIRRORED-AB-PROTOCOL.md](MIRRORED-AB-PROTOCOL.md) — clean-room task
+  envelopes, startup injection, sealed submissions, and adjudication.
 - [runs/2026-07-13-bigbounce-readonly-review.md](runs/2026-07-13-bigbounce-readonly-review.md)
   — first live Codex/Claude CMUX dogfood result and the corrected mirrored-A/B
   protocol.

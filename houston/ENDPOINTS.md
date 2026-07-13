@@ -27,6 +27,14 @@ The layout API maps to cmux RPC methods such as `workspace.create`,
 `notification.create`. Positional refs are rediscovered; the spawn receipt keeps
 the stable window UUID.
 
+For completion observation, use the event names verified by this upstream
+version: `agent.hook` and `notification.created`. Do not substitute the
+unverified `notification.requested` name. Because outside-terminal
+`send`/`read-screen` deadlocked on this cmux 0.64.17/macOS 26.5 host, mirrored
+A/B orchestrator task delivery is declarative at workspace startup. Lead and
+worker startup commands receive only the envelope path/hash and wait for
+dispatch. Events are secondary telemetry, not the source of task truth.
+
 ## Codex and Claude subscription surfaces (available)
 
 | Provider | Login | Session launch |
@@ -104,3 +112,40 @@ When Work Claims ships, the You.md MCP should expose the same contract as tools:
 
 CLI, MCP, HTTP, daemon, and web UI must share one backend claim record and one
 schema. Do not implement separate “cmux claims” and “You.md claims.”
+
+## Mirrored A/B run surfaces (local contract)
+
+The A/B protocol adds no provider endpoint and requires no provider key. Its
+local artifacts are:
+
+| Artifact | Required fields / behavior |
+|---|---|
+| Task envelope | schema, task ID, repository identity, HEAD SHA, dirty digest, mode, scope, prompt hash, acceptance commands, deadline |
+| Arm manifest | envelope hash, arm ID, orchestrator identity, identical lead/worker matrix, output path |
+| Submission receipt | team, result SHA-256, byte count, and readiness; no payload |
+| Result payload | answer/patch reference, evidence, commands/results, timings, model route, worker dissent, declared limitations |
+| Adjudication receipt | both token IDs/hashes, reveal timestamp, metric scores, winner/tie/no-decision, rationale |
+
+Operators use the implemented local helper directly:
+
+```bash
+python3 scripts/sealed_results.py status --root "$SEALED_ROOT"
+python3 scripts/sealed_results.py reveal --root "$SEALED_ROOT"
+```
+
+Orchestrators submit JSON using the capability injected only into their own
+startup command:
+
+```bash
+SEALED_RESULTS_TOKEN="$TEAM_TOKEN" \
+  python3 scripts/sealed_results.py submit \
+  --root "$SEALED_ROOT" --team codex --input /tmp/codex-result.json
+```
+
+`--token-file` is preferred for manual operation. The shared task envelope and
+spawn receipt contain no plaintext capability tokens; the helper contract keeps
+only token hashes. You.md may carry opaque submission receipts on a dedicated
+channel, but it must not publish either result body until both arms are sealed.
+A future server-backed
+evaluation endpoint should enforce two-party reveal; the current same-user
+filesystem/cmux procedure is cooperative rather than adversarially isolated.

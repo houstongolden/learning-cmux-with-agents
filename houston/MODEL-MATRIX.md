@@ -4,6 +4,11 @@ Defaults prioritize subscription access, judgment at the top, and cheaper
 independent workers. Every model ID can be overridden on the launcher command
 line because account-visible aliases evolve.
 
+Direct subscription smokes on 2026-07-13 verified `gpt-5.6-sol` at high effort
+through Codex and `claude-opus-4-8` at high effort through Claude Max. Worker
+models remain configuration choices; the default Codex worker uses the verified
+`gpt-5.6-sol` family at low effort rather than assuming `gpt-5.4-mini` access.
+
 | Role | CLI | Default model | Effort | Default permissions | Why |
 |---|---|---|---|---|---|
 | Primary orchestrator | Codex | `gpt-5.6-sol` | high | cmux control; no repo edits by contract | final routing and synthesis |
@@ -28,12 +33,20 @@ python3 scripts/spawn_subscription_fleet.py \
   --claude-worker-model sonnet
 ```
 
-## Suggested experiments
+## Mirrored experiment matrix
 
-1. Give both orchestrators the same saved spawn receipt and task, one at a time.
-2. Keep the lead/workers, base SHA, claim scope, and acceptance test identical.
-3. Record wall time, tool calls, worker disagreement, reproduced tests, diff
-   size, and reviewer findings.
-4. Have the non-producing orchestrator score the result blind where possible.
-5. For science, score source fidelity, derivation validity, uncertainty, and
-   preserved dissent; never reduce evaluation to speed or majority vote.
+| Variable | Arm A | Arm B |
+|---|---|---|
+| Orchestrator | Codex `gpt-5.6-sol`, high | Claude `claude-opus-4-8`, high |
+| Lead/workers | fixed shared matrix | identical fixed shared matrix |
+| Task envelope / HEAD / dirty digest | identical | identical |
+| Startup injection / permissions / tools | identical | identical |
+| Result visibility before seal | own arm only | own arm only |
+
+Score both arms only after the two result tokens are sealed. Coding metrics are
+acceptance-test pass rate, regression failures, correctness findings, security
+findings, diff surface, evidence reproducibility, unnecessary churn, elapsed
+time, and subscription usage if observable. Science metrics are source fidelity,
+derivation validity, dimensional/statistical checks, uncertainty calibration,
+reproducibility, anomaly/claim consistency, and preserved dissent. Speed is a
+tie-breaker after correctness, never the primary score.

@@ -14,6 +14,10 @@ If `cmux` is not on `PATH` outside the app, link the bundled CLI:
 ln -sf /Applications/cmux.app/Contents/Resources/bin/cmux /opt/homebrew/bin/cmux
 ```
 
+On an Intel/Homebrew or locked `/opt/homebrew/bin` installation, use a writable
+directory already on `PATH`; `/usr/local/bin/cmux` with `sudo ln -sf ...` is a
+fallback, not the preferred Apple Silicon path.
+
 Open **cmux Settings -> Automation** and allow socket control for the terminal
 that will run the orchestrator. The launcher checks `cmux identify --json` and
 will open cmux automatically, but it does not silently weaken automation
@@ -81,7 +85,7 @@ Dry-run prints the final layout, model routing, primary command, comparison
 command, and (for mutation mode) proposed worktrees. It performs no writes,
 does not acquire a claim, and does not start model sessions.
 
-## 4. Start the read-only comparison fleet
+## 4. Start one read-only fleet
 
 ```bash
 python3 scripts/spawn_subscription_fleet.py \
@@ -116,7 +120,58 @@ python3 scripts/spawn_subscription_fleet.py \
   --claude-orchestrator-model claude-opus-4-8
 ```
 
-## 5. Mutation is intentionally blocked today
+## 5. Run a mirrored A/B comparison
+
+Put the exact task in a UTF-8 file, then let the launcher generate the immutable
+envelope and both arms in one operation:
+
+```bash
+python3 scripts/spawn_subscription_fleet.py \
+  --repo /absolute/path/to/repo \
+  --project feature-ab \
+  --mirrored \
+  --task-file /absolute/path/to/task.md
+```
+
+The envelope binds the task to repository HEAD, the tracked staged+unstaged
+binary diff, and an ordered untracked path/type/mode/content-or-symlink-target
+hash manifest. If the checkout changes after envelope creation, invalidate the
+run.
+
+Start two fresh fleet workspaces from that same envelope:
+
+- arm A: Codex `gpt-5.6-sol`, high-effort orchestrator;
+- arm B: Claude `claude-opus-4-8`, high-effort orchestrator;
+- both: equivalent lead/worker prompt templates and identical models, tools,
+  permissions, time budget, and acceptance commands.
+
+The launcher embeds the full task in both orchestrator startup commands. The
+lead and four workers receive the same envelope path/hash in their startup
+prompts, then wait for their own orchestrator/lead to dispatch the task. Do not
+depend on outside-terminal `send` for initial orchestrator delivery. Each
+orchestrator prepares a JSON payload and submits it through
+`scripts/sealed_results.py submit`; it must not write directly into the sealed
+root. Plaintext capability tokens are injected only into their owning startup
+commands. The shared task envelope and spawn receipt do not contain them.
+
+Copy the nested `sealed_results.root` path printed by the launcher, then observe
+without revealing payloads:
+
+```bash
+SEALED_ROOT=/absolute/path/printed/by/the/launcher
+python3 scripts/sealed_results.py status --root "$SEALED_ROOT"
+```
+
+Reveal is fail-closed until both submissions exist:
+
+```bash
+python3 scripts/sealed_results.py reveal --root "$SEALED_ROOT"
+```
+
+The exact envelope, submission, and scoring contracts are in
+[MIRRORED-AB-PROTOCOL.md](MIRRORED-AB-PROTOCOL.md).
+
+## 6. Mutation is intentionally blocked today
 
 The command exists to prove the guardrail:
 
@@ -137,8 +192,9 @@ are specified in [ENDPOINTS.md](ENDPOINTS.md).
 On macOS 26.5, external `allowAll` socket control created workspaces but repeated
 `send` and `read-screen` calls timed out and required a cmux restart. This
 launcher therefore boots commands declaratively and puts both orchestrator and
-team inside cmux. Treat outside-terminal screen driving as unverified until a
-cmux update and diagnostics pass prove it again.
+team inside cmux. In-cmux wrappers and native `cmux codex-teams` /
+`cmux claude-teams` are the safe fallback. Treat outside-terminal screen driving
+as unverified until a cmux update and diagnostics pass prove it again.
 
 ## Troubleshooting
 
