@@ -1,0 +1,80 @@
+{
+  "_comment": "Houston subscription-first template, adapted from upstream cmux/fs-team.layout.json. Tokens are rendered by scripts/spawn_subscription_fleet.py. Lead occupies the left half; explorer/reviewer/tester/comparator fill a 2x2 grid on the right. No env-file or provider API key is used.",
+  "direction": "horizontal",
+  "split": 0.5,
+  "children": [
+    {
+      "pane": {
+        "surfaces": [
+          {
+            "type": "terminal",
+            "name": "lead",
+            "command": "__LEAD_COMMAND__"
+          }
+        ]
+      }
+    },
+    {
+      "direction": "vertical",
+      "split": 0.5,
+      "children": [
+        {
+          "direction": "horizontal",
+          "split": 0.5,
+          "children": [
+            {
+              "pane": {
+                "surfaces": [
+                  {
+                    "type": "terminal",
+                    "name": "explorer",
+                    "command": "__EXPLORER_COMMAND__"
+                  }
+                ]
+              }
+            },
+            {
+              "pane": {
+                "surfaces": [
+                  {
+                    "type": "terminal",
+                    "name": "reviewer",
+                    "command": "__REVIEWER_COMMAND__"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "direction": "horizontal",
+          "split": 0.5,
+          "children": [
+            {
+              "pane": {
+                "surfaces": [
+                  {
+                    "type": "terminal",
+                    "name": "tester",
+                    "command": "__TESTER_COMMAND__"
+                  }
+                ]
+              }
+            },
+            {
+              "pane": {
+                "surfaces": [
+                  {
+                    "type": "terminal",
+                    "name": "comparator",
+                    "command": "__COMPARATOR_COMMAND__"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
