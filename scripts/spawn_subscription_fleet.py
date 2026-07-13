@@ -266,6 +266,264 @@ def create_workspace(name: str, repo: Path, layout: dict) -> dict:
         die(f"cmux returned non-JSON workspace output: {result.stdout.strip()}")
 
 
+class MirroredLaunchError(RuntimeError):
+    """A mirrored fleet failed before its launch barrier was released."""
+
+
+def barrier_command(value: str, gate_path: Path) -> str:
+    """Wrap one agent command so its CLI cannot start before gate release."""
+
+    return command(
+        [
+            "/bin/sh",
+            "-c",
+            'while [ ! -f "$1" ]; do sleep 0.1; done; exec /bin/sh -c "$2"',
+            "cmux-launch-barrier",
+            str(gate_path),
+            value,
+        ]
+    )
+
+
+def barrier_layout(layout: dict, gate_path: Path) -> dict:
+    """Return a copy whose terminal commands all wait on the same gate."""
+
+    def wrap(value):
+        if isinstance(value, dict):
+            result = {key: wrap(child) for key, child in value.items()}
+            if result.get("type") == "terminal" and isinstance(result.get("command"), str):
+                result["command"] = barrier_command(result["command"], gate_path)
+            return result
+        if isinstance(value, list):
+            return [wrap(child) for child in value]
+        return value
+
+    return wrap(layout)
+
+
+def terminal_names(layout: dict) -> list[str]:
+    names: list[str] = []
+
+    def collect(value) -> None:
+        if isinstance(value, dict):
+            if value.get("type") == "terminal" and isinstance(value.get("name"), str):
+                names.append(value["name"])
+            for child in value.values():
+                collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    collect(layout)
+    return sorted(names)
+
+
+def read_cmux_topology() -> dict:
+    try:
+        result = run("cmux", "tree", "--all", "--json", timeout=15)
+    except subprocess.TimeoutExpired:
+        die("cmux topology query timed out before launch-barrier release")
+    if result.returncode != 0:
+        die((result.stderr or result.stdout).strip() or "cmux topology query failed")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        die("cmux topology query returned invalid JSON")
+
+
+def verify_topology(topology: dict, expected: list[dict[str, object]]) -> None:
+    actual: dict[str, dict] = {}
+    for window in topology.get("windows", []):
+        for workspace in window.get("workspaces", []):
+            ref = workspace.get("ref")
+            if isinstance(ref, str):
+                actual[ref] = workspace
+
+    problems: list[str] = []
+    for item in expected:
+        ref = str(item["ref"])
+        workspace = actual.get(ref)
+        if workspace is None:
+            problems.append(f"missing {ref}")
+            continue
+        if workspace.get("title") != item["name"]:
+            problems.append(f"{ref} title mismatch")
+        surfaces = [
+            surface
+            for pane in workspace.get("panes", [])
+            for surface in pane.get("surfaces", [])
+        ]
+        names = sorted(
+            surface.get("title") for surface in surfaces if isinstance(surface.get("title"), str)
+        )
+        if names != item["terminal_names"]:
+            problems.append(f"{ref} terminal topology mismatch")
+        if any(surface.get("type") != "terminal" for surface in surfaces):
+            problems.append(f"{ref} contains a non-terminal surface")
+    if problems:
+        raise MirroredLaunchError("expected CMUX topology is not ready: " + "; ".join(problems))
+
+
+def close_workspace(ref: str) -> None:
+    try:
+        result = run("cmux", "workspace", "close", ref, timeout=15)
+    except subprocess.TimeoutExpired as exc:
+        raise MirroredLaunchError(f"rollback timed out closing {ref}") from exc
+    if result.returncode != 0:
+        raise MirroredLaunchError(
+            (result.stderr or result.stdout).strip() or f"rollback failed closing {ref}"
+        )
+
+
+def release_barrier(gate_path: Path, payload: dict) -> None:
+    gate_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = gate_path.with_name(f".{gate_path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(sealed_results.canonical_json(payload))
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(0o444)
+        os.replace(temporary, gate_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_receipt(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(sealed_results.canonical_json(payload))
+
+
+def public_workspace_response(response: dict) -> dict:
+    """Keep receipts free of echoed layouts, prompts, and capability tokens."""
+
+    allowed = ("workspace_ref", "window_ref", "surface_ref", "group_ref")
+    return {key: response.get(key) for key in allowed if key in response}
+
+
+def launch_mirrored_workspaces(
+    *,
+    repo: Path,
+    project: str,
+    team_layouts: dict[str, dict],
+    orchestrator_layouts: dict[str, dict],
+    workspace_names: dict[str, str],
+    gate_path: Path,
+    receipt_path: Path,
+    receipt: dict,
+) -> dict:
+    """Create, verify, then atomically release a four-workspace fleet."""
+
+    specs: list[dict[str, object]] = []
+    for kind in ("codex", "claude"):
+        specs.append(
+            {
+                "role": f"{kind}-team",
+                "name": workspace_names[kind],
+                "layout": team_layouts[kind],
+            }
+        )
+    for kind in ("codex", "claude"):
+        specs.append(
+            {
+                "role": f"{kind}-orchestrator",
+                "name": f"{project}-{kind}-orchestrator",
+                "layout": orchestrator_layouts[kind],
+            }
+        )
+
+    created: list[dict[str, object]] = []
+    try:
+        if gate_path.exists():
+            raise MirroredLaunchError(f"refusing to reuse an already released barrier: {gate_path}")
+        for spec in specs:
+            try:
+                response = create_workspace(
+                    str(spec["name"]), repo, barrier_layout(spec["layout"], gate_path)
+                )
+            except (Exception, SystemExit) as exc:
+                # CMUX errors may echo the submitted layout. Never persist that
+                # raw text because orchestrator layouts carry one capability.
+                raise MirroredLaunchError(
+                    f"workspace creation failed for {spec['name']}"
+                ) from exc
+            ref = response.get("workspace_ref")
+            if not isinstance(ref, str) or not ref:
+                raise MirroredLaunchError(
+                    f"cmux create for {spec['name']} did not return a workspace_ref"
+                )
+            created.append(
+                {
+                    "role": spec["role"],
+                    "name": spec["name"],
+                    "ref": ref,
+                    "terminal_names": terminal_names(spec["layout"]),
+                    "response": public_workspace_response(response),
+                }
+            )
+
+        topology = read_cmux_topology()
+        verify_topology(topology, created)
+        release_barrier(
+            gate_path,
+            {
+                "project": project,
+                "workspace_refs": [item["ref"] for item in created],
+                "topology_verified": True,
+            },
+        )
+    except (Exception, SystemExit) as exc:
+        rollback = {"attempted": [], "closed": [], "errors": {}}
+        for item in reversed(created):
+            ref = str(item["ref"])
+            rollback["attempted"].append(ref)
+            try:
+                close_workspace(ref)
+                rollback["closed"].append(ref)
+            except Exception as close_error:
+                rollback["errors"][ref] = str(close_error)
+        failure = {
+            **receipt,
+            "valid": False,
+            "status": "launch_failed",
+            "launch_barrier": {"path": str(gate_path), "released": False},
+            "created_workspaces": [
+                {key: item[key] for key in ("role", "name", "ref")} for item in created
+            ],
+            "rollback": rollback,
+            "error": str(exc),
+        }
+        write_receipt(receipt_path, failure)
+        raise MirroredLaunchError(str(exc)) from exc
+
+    successful = {
+        **receipt,
+        "valid": True,
+        "status": "running",
+        "launch_barrier": {"path": str(gate_path), "released": True},
+        "topology": {
+            "verified": True,
+            "workspaces": [
+                {key: item[key] for key in ("role", "name", "ref")} for item in created
+            ],
+        },
+        "teams": {
+            kind: next(item["response"] for item in created if item["role"] == f"{kind}-team")
+            for kind in ("codex", "claude")
+        },
+        "orchestrators": {
+            kind: next(
+                item["response"]
+                for item in created
+                if item["role"] == f"{kind}-orchestrator"
+            )
+            for kind in ("codex", "claude")
+        },
+    }
+    write_receipt(receipt_path, successful)
+    return successful
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--repo", type=Path)
@@ -406,9 +664,14 @@ def main() -> None:
     if args.mirrored:
         snapshot = repo_snapshot(repo)
         task_digest = sha256(task or "")
-        run_id = f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{task_digest[:12]}"
+        run_id = (
+            f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-"
+            f"{time.time_ns() % 1_000_000_000:09d}-{task_digest[:12]}"
+        )
         envelope_path = ROOT / ".team" / f"{project}.{run_id}.task-envelope.json"
         seal_root = ROOT / ".team" / "sealed-results" / project / run_id
+        gate_path = ROOT / ".team" / "launch-gates" / project / run_id / "released.json"
+        receipt_path = ROOT / ".team" / f"{project}.{run_id}.subscription-spawn.json"
         teams = ("codex", "claude")
         if args.dry_run:
             capabilities = {kind: f"<REDACTED-{kind.upper()}-CAPABILITY>" for kind in teams}
@@ -486,6 +749,7 @@ def main() -> None:
             "project": project,
             "task_envelope": str(envelope_path),
             "task_envelope_sha256": envelope_sha256,
+            "launch_barrier": {"path": str(gate_path), "released": False},
             "envelope": envelope,
             "team_workspaces": envelope["teams"],
             "orchestrators": {
@@ -509,8 +773,6 @@ def main() -> None:
         exclusive_json(envelope_path, envelope)
         ensure_cmux()
         receipt: dict[str, object] = {
-            "teams": {},
-            "orchestrators": {},
             "project": project,
             "repo": str(repo),
             "mode": args.mode,
@@ -520,16 +782,19 @@ def main() -> None:
             "target_snapshot": snapshot,
             "sealed_results": seal_metadata,
         }
-        for kind in teams:
-            workspace = envelope["teams"][kind]
-            receipt["teams"][kind] = create_workspace(workspace, repo, layouts[kind])
-            receipt["orchestrators"][kind] = create_workspace(
-                f"{project}-{kind}-orchestrator",
-                repo,
-                primary_layouts[kind],
+        try:
+            receipt = launch_mirrored_workspaces(
+                repo=repo,
+                project=project,
+                team_layouts=layouts,
+                orchestrator_layouts=primary_layouts,
+                workspace_names=envelope["teams"],
+                gate_path=gate_path,
+                receipt_path=receipt_path,
+                receipt=receipt,
             )
-        receipt_path = ROOT / ".team" / f"{project}.{run_id}.subscription-spawn.json"
-        receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+        except MirroredLaunchError as exc:
+            die(f"mirrored fleet launch failed before barrier release: {exc}")
         print(json.dumps({"ok": True, "receipt": str(receipt_path), **receipt}, indent=2))
         return
 

@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 from scripts import spawn_subscription_fleet as fleet
 
@@ -105,6 +106,94 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
         self.assertNotIn("-C", parts)
         self.assertFalse(any("trust_level" in part for part in parts))
         self.assertNotIn("ANTHROPIC_API_KEY", value)
+
+    @staticmethod
+    def _launch_layout(*names: str) -> dict:
+        return {
+            "pane": {
+                "surfaces": [
+                    {"type": "terminal", "name": name, "command": f"agent-{name}"}
+                    for name in names
+                ]
+            }
+        }
+
+    @staticmethod
+    def _assert_barriered(layout: dict, gate: Path) -> None:
+        commands: list[str] = []
+
+        def collect(value) -> None:
+            if isinstance(value, dict):
+                if value.get("type") == "terminal":
+                    commands.append(value["command"])
+                for child in value.values():
+                    collect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child)
+
+        collect(layout)
+        assert commands
+        for value in commands:
+            parts = shlex.split(value)
+            assert parts[0] == "/bin/sh"
+            assert str(gate) in parts
+            assert "while [ ! -f" in parts[2]
+
+    @staticmethod
+    def _mock_topology(include_claude_orchestrator: bool = True) -> dict:
+        specs = [
+            ("workspace:101", "barrier-test-codex-team", ("lead", "worker")),
+            ("workspace:102", "barrier-test-claude-team", ("lead", "worker")),
+            ("workspace:103", "barrier-test-codex-orchestrator", ("codex-orchestrator",)),
+            ("workspace:104", "barrier-test-claude-orchestrator", ("claude-orchestrator",)),
+        ]
+        if not include_claude_orchestrator:
+            specs.pop()
+        return {
+            "windows": [
+                {
+                    "workspaces": [
+                        {
+                            "ref": ref,
+                            "title": title,
+                            "panes": [
+                                {
+                                    "surfaces": [
+                                        {"title": name, "type": "terminal"} for name in names
+                                    ]
+                                }
+                            ],
+                        }
+                        for ref, title, names in specs
+                    ]
+                }
+            ]
+        }
+
+    def _launch_inputs(self) -> dict:
+        return {
+            "repo": self.repo,
+            "project": "barrier-test",
+            "team_layouts": {
+                "codex": self._launch_layout("lead", "worker"),
+                "claude": self._launch_layout("lead", "worker"),
+            },
+            "orchestrator_layouts": {
+                "codex": self._launch_layout("codex-orchestrator"),
+                "claude": self._launch_layout("claude-orchestrator"),
+            },
+            "workspace_names": {
+                "codex": "barrier-test-codex-team",
+                "claude": "barrier-test-claude-team",
+            },
+            "gate_path": self.base / "gate" / "released.json",
+            "receipt_path": self.base / "launch-receipt.json",
+            "receipt": {
+                "project": "barrier-test",
+                "sealed_results": {"contract_sha256": "a" * 64},
+            },
+        }
 
     def test_mirrored_dry_run_accepts_inline_task_and_task_file(self) -> None:
         task_file = self.base / "task.txt"
@@ -248,6 +337,98 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
             second_snapshot["untracked_manifest_sha256"],
         )
         self.assertNotEqual(first_snapshot["snapshot_sha256"], second_snapshot["snapshot_sha256"])
+
+    def test_create_failure_keeps_agents_behind_barrier_and_rolls_back_owned_ref(self) -> None:
+        inputs = self._launch_inputs()
+        responses = (
+            {"workspace_ref": "workspace:101", "echoed_layout": "SEALED_RESULTS_TOKEN=secret"},
+            SystemExit("create failed SEALED_RESULTS_TOKEN=secret"),
+        )
+
+        with (
+            mock.patch.object(fleet, "create_workspace", side_effect=responses) as create,
+            mock.patch.object(fleet, "close_workspace") as close,
+            mock.patch.object(fleet, "read_cmux_topology") as topology,
+        ):
+            with self.assertRaises(fleet.MirroredLaunchError):
+                fleet.launch_mirrored_workspaces(**inputs)
+
+        self.assertEqual(create.call_count, 2)
+        for call in create.call_args_list:
+            self._assert_barriered(call.args[2], inputs["gate_path"])
+        topology.assert_not_called()
+        close.assert_called_once_with("workspace:101")
+        self.assertFalse(inputs["gate_path"].exists())
+
+        failure = json.loads(inputs["receipt_path"].read_text(encoding="utf-8"))
+        self.assertFalse(failure["valid"])
+        self.assertEqual(failure["status"], "launch_failed")
+        self.assertFalse(failure["launch_barrier"]["released"])
+        self.assertEqual(failure["rollback"]["attempted"], ["workspace:101"])
+        self.assertEqual(failure["rollback"]["closed"], ["workspace:101"])
+        self.assertNotIn("TOKEN", json.dumps(failure))
+
+    def test_topology_failure_rolls_back_only_four_invocation_owned_refs(self) -> None:
+        inputs = self._launch_inputs()
+        refs = [f"workspace:{number}" for number in range(101, 105)]
+
+        def create_side_effect(_name, _repo, layout):
+            self.assertFalse(inputs["gate_path"].exists())
+            self._assert_barriered(layout, inputs["gate_path"])
+            return {"workspace_ref": refs.pop(0)}
+
+        with (
+            mock.patch.object(fleet, "create_workspace", side_effect=create_side_effect) as create,
+            mock.patch.object(
+                fleet, "read_cmux_topology", return_value=self._mock_topology(False)
+            ),
+            mock.patch.object(fleet, "close_workspace") as close,
+        ):
+            with self.assertRaises(fleet.MirroredLaunchError):
+                fleet.launch_mirrored_workspaces(**inputs)
+
+        self.assertEqual(create.call_count, 4)
+        self.assertEqual(
+            [call.args[0] for call in close.call_args_list],
+            ["workspace:104", "workspace:103", "workspace:102", "workspace:101"],
+        )
+        self.assertFalse(inputs["gate_path"].exists())
+        failure = json.loads(inputs["receipt_path"].read_text(encoding="utf-8"))
+        self.assertFalse(failure["valid"])
+        self.assertIn("missing workspace:104", failure["error"])
+        self.assertEqual(len(failure["created_workspaces"]), 4)
+        self.assertNotIn("TOKEN", json.dumps(failure))
+
+    def test_barrier_releases_only_after_complete_topology_is_observed(self) -> None:
+        inputs = self._launch_inputs()
+        refs = iter(f"workspace:{number}" for number in range(101, 105))
+
+        def create_side_effect(_name, _repo, layout):
+            self.assertFalse(inputs["gate_path"].exists())
+            self._assert_barriered(layout, inputs["gate_path"])
+            return {
+                "workspace_ref": next(refs),
+                "echoed_layout": "SEALED_RESULTS_TOKEN=secret",
+            }
+
+        def topology_side_effect():
+            self.assertFalse(inputs["gate_path"].exists())
+            return self._mock_topology()
+
+        with (
+            mock.patch.object(fleet, "create_workspace", side_effect=create_side_effect) as create,
+            mock.patch.object(fleet, "read_cmux_topology", side_effect=topology_side_effect),
+            mock.patch.object(fleet, "close_workspace") as close,
+        ):
+            receipt = fleet.launch_mirrored_workspaces(**inputs)
+
+        self.assertEqual(create.call_count, 4)
+        close.assert_not_called()
+        self.assertTrue(inputs["gate_path"].is_file())
+        self.assertTrue(receipt["valid"])
+        self.assertTrue(receipt["launch_barrier"]["released"])
+        self.assertTrue(receipt["topology"]["verified"])
+        self.assertNotIn("TOKEN", json.dumps(receipt))
 
 
 if __name__ == "__main__":
