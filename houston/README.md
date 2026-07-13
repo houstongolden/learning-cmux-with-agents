@@ -62,6 +62,9 @@ lease. The required claim API and isolated-worktree rollout are specified in
   what exists today versus the atomic lease API still needed.
 - [MODEL-MATRIX.md](MODEL-MATRIX.md) — model/effort/permission defaults and
   override examples.
+- [runs/2026-07-13-bigbounce-readonly-review.md](runs/2026-07-13-bigbounce-readonly-review.md)
+  — first live Codex/Claude CMUX dogfood result and the corrected mirrored-A/B
+  protocol.
 
 ## Attribution
 
