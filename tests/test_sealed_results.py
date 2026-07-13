@@ -4,8 +4,10 @@ import importlib.util
 import json
 import stat
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "sealed_results.py"
@@ -74,6 +76,84 @@ class SealedResultsTests(unittest.TestCase):
             sealed_results.sha256_hex(sealed_results.canonical_json(first_envelope)),
             sealed_results.sha256_hex(sealed_results.canonical_json(second_envelope)),
         )
+
+    def test_partial_staging_is_invisible_until_atomic_publish(self) -> None:
+        sealed_results.submit(self.root, "opus", self.tokens["opus"], {"verdict": "ready"})
+        staged = threading.Event()
+        release = threading.Event()
+        failures: list[BaseException] = []
+
+        def blocked_write(fd: int, data: bytes) -> None:
+            os_write = sealed_results.os.write
+            written = os_write(fd, data[:7])
+            self.assertEqual(written, 7)
+            staged.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("test did not release blocked sealed-result writer")
+            remaining = memoryview(data)[7:]
+            while remaining:
+                count = os_write(fd, remaining)
+                remaining = remaining[count:]
+            sealed_results.os.fsync(fd)
+
+        def writer() -> None:
+            try:
+                sealed_results.submit(
+                    self.root,
+                    "sol",
+                    self.tokens["sol"],
+                    {"verdict": "complete only"},
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+        with mock.patch.object(sealed_results, "_write_bytes_and_sync", side_effect=blocked_write):
+            thread = threading.Thread(target=writer)
+            thread.start()
+            self.assertTrue(staged.wait(timeout=5))
+            waiting = sealed_results.status(self.root)
+            self.assertFalse(waiting["ready"])
+            self.assertEqual(waiting["missing"], ["sol"])
+            self.assertFalse(waiting["results"]["sol"]["submitted"])
+            with self.assertRaises(sealed_results.NotReadyError):
+                sealed_results.reveal(self.root)
+            release.set()
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(
+            sealed_results.reveal(self.root)["results"]["sol"]["payload"],
+            {"verdict": "complete only"},
+        )
+
+    def test_interrupted_staging_cleans_up_and_allows_retry(self) -> None:
+        def interrupted_write(fd: int, data: bytes) -> None:
+            sealed_results.os.write(fd, data[:5])
+            raise InterruptedError("simulated interruption before publication")
+
+        with mock.patch.object(
+            sealed_results,
+            "_write_bytes_and_sync",
+            side_effect=interrupted_write,
+        ):
+            with self.assertRaises(InterruptedError):
+                sealed_results.submit(
+                    self.root,
+                    "sol",
+                    self.tokens["sol"],
+                    {"attempt": 1},
+                )
+
+        self.assertFalse((self.root / "results" / "sol.json").exists())
+        self.assertEqual(list((self.root / "results").glob(".sol.json.tmp-*")), [])
+        receipt = sealed_results.submit(
+            self.root,
+            "sol",
+            self.tokens["sol"],
+            {"attempt": 2},
+        )
+        self.assertEqual(len(receipt["sha256"]), 64)
 
 
 if __name__ == "__main__":

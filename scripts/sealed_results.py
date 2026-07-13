@@ -76,24 +76,72 @@ def _result_path(root: Path, team: str) -> Path:
     return root / "results" / f"{team}.json"
 
 
+def _write_bytes_and_sync(fd: int, data: bytes) -> None:
+    """Write every byte to an unpublished inode and make its contents durable."""
+
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError("short write while staging sealed result")
+        remaining = remaining[written:]
+    os.fsync(fd)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort durability barrier for directory-entry changes."""
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(fd)
+        except OSError:
+            # Some supported filesystems do not permit directory fsync.
+            pass
+    finally:
+        os.close(fd)
+
+
 def _write_once(path: Path, data: bytes, final_mode: int = 0o444) -> None:
-    """Create a final-path file exactly once, then make it read-only."""
+    """Publish complete bytes atomically without replacing an existing result."""
 
+    temp_path = path.parent / f".{path.name}.tmp-{secrets.token_hex(16)}"
+    fd: int | None = None
+    published = False
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
-    except FileExistsError as exc:
-        raise AlreadySubmittedError(f"refusing to overwrite {path}") from exc
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        _write_bytes_and_sync(fd, data)
+        os.fchmod(fd, final_mode)
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
 
-    try:
-        with os.fdopen(fd, "wb", closefd=True) as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(path, final_mode)
-    except BaseException:
-        # A partial result remains intentionally reserved. Removing it would
-        # allow a second submission and violate the one-way contract.
-        raise
+        try:
+            # A hard link publishes the fully synced inode as one directory
+            # operation and, unlike rename(), fails if the final name exists.
+            os.link(temp_path, path)
+        except FileExistsError as exc:
+            raise AlreadySubmittedError(f"refusing to overwrite {path}") from exc
+        published = True
+        _fsync_directory(path.parent)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Once linked, the complete read-only final result remains valid;
+            # an orphaned private link is cleanup debt, not publication loss.
+            if not published:
+                raise
+        if published:
+            _fsync_directory(path.parent)
 
 
 def initialize(root: Path, teams: Sequence[str]) -> dict[str, Any]:
