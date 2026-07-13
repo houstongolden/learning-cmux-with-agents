@@ -20,6 +20,13 @@ startup plus in-cmux control. The spawn receipt records the stable window UUID
 and workspace name; agents rediscover positional surface refs immediately
 before use because refs can renumber.
 
+Codex process bootstrap also binds the exact repository twice: `-C <repo>` sets
+the working root and a per-invocation
+`projects."<repo>".trust_level="trusted"` override clears the interactive
+trust gate. Exact-project trust was not inherited reliably from a trusted
+parent. Keeping this on the generated command avoids global config mutation and
+keeps both mirrored arms reproducible.
+
 ## Read-only is the default
 
 `compare` mode is designed for multi-model evaluation and science/review work:

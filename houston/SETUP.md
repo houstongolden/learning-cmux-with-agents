@@ -61,6 +61,24 @@ The launcher deliberately does not pass `--env-file`, inspect `.env`, or read
 your existing shell environment, unset it in that shell before launch so the
 interactive subscription login is authoritative.
 
+### Codex project trust is per invocation
+
+Do not assume Codex will inherit trust for an exact checkout merely because its
+parent directory is trusted. The first mirrored run stalled on that prompt at
+the 20-minute mark, so it is diagnostic-only and must not be reported as a clean
+orchestrator comparison.
+
+The launcher now builds every Codex invocation with the resolved target path:
+
+```bash
+codex -C /absolute/path/to/repo \
+  -c 'projects."/absolute/path/to/repo".trust_level="trusted"' ...
+```
+
+This scopes the override to that process, avoids the interactive trust stall,
+and does not edit `~/.codex/config.toml`. The mirrored rerun must start two fresh
+arms; do not resume the trust-stalled sessions.
+
 ## 3. Validate without launching anything
 
 From this repository:
@@ -201,6 +219,9 @@ as unverified until a cmux update and diagnostics pass prove it again.
 - `cmux failed to start`: open the app and check **Settings -> Automation**.
 - `model not available`: pass the account-visible model ID with the matching
   `--*-model` flag; do not add a provider key.
+- Codex shows a trust prompt: stop that arm and confirm the generated command
+  contains exact matching `-C` and `projects."<repo>".trust_level="trusted"`
+  values; do not click through and count the run as comparable.
 - worker stops for permissions: keep the default read-only mode, or use mutation
   mode so each worker gets a writable worktree.
 - duplicate work detected: stop before dispatching, inspect the claim message

@@ -61,6 +61,17 @@ The launcher prints the task-envelope and spawn-receipt paths; the sealed root
 is the nested `sealed_results.root` field. The shared envelope and receipt
 contain capability hashes/references, not plaintext submission tokens.
 
+Codex trust is also pinned per process. Trust for the exact target checkout was
+not inherited reliably from a trusted parent directory, so every generated
+Codex command includes both `-C <absolute-repo>` and
+`-c 'projects."<absolute-repo>".trust_level="trusted"'`. This avoids an
+interactive trust prompt without changing global Codex configuration.
+
+The first mirrored attempt reached this trust prompt at the 20-minute mark and
+is diagnostic-only. It did not produce a clean Codex-versus-Claude comparison;
+rerun both fresh arms with the per-invocation trust fix before drawing model
+conclusions.
+
 Mutation is currently fail-closed:
 
 ```bash
@@ -84,8 +95,8 @@ lease. The required claim API and isolated-worktree rollout are specified in
 - [MIRRORED-AB-PROTOCOL.md](MIRRORED-AB-PROTOCOL.md) — clean-room task
   envelopes, startup injection, sealed submissions, and adjudication.
 - [runs/2026-07-13-bigbounce-readonly-review.md](runs/2026-07-13-bigbounce-readonly-review.md)
-  — first live Codex/Claude CMUX dogfood result and the corrected mirrored-A/B
-  protocol.
+  — earlier CMUX dogfood diagnostics and the motivation for the corrected
+  mirrored-A/B protocol; not a clean orchestrator comparison.
 
 ## Attribution
 
