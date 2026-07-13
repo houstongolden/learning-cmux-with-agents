@@ -63,10 +63,23 @@ def sha256(value: bytes | str) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def codex_cmd(model: str, effort: str, prompt: str, *, controller: bool) -> str:
+def codex_cmd(
+    model: str,
+    effort: str,
+    prompt: str,
+    *,
+    controller: bool,
+    repo: Path,
+) -> str:
+    repo = repo.resolve()
+    trust_override = f'projects.{json.dumps(str(repo))}.trust_level="trusted"'
     return command(
         [
             "codex",
+            "-C",
+            str(repo),
+            "-c",
+            trust_override,
             "--model",
             model,
             "-c",
@@ -160,10 +173,16 @@ def render_team(
         "comparator": f"You are the COMPARATOR for {common} Wait for the lead. End assignments with FLEET-DONE: comparator | <summary>.",
     }
     commands = {
-        "__LEAD_COMMAND__": codex_cmd(args.codex_lead_model, "medium", prompts["lead"], controller=True),
-        "__EXPLORER_COMMAND__": codex_cmd(args.codex_worker_model, "low", prompts["explorer"], controller=False),
+        "__LEAD_COMMAND__": codex_cmd(
+            args.codex_lead_model, "medium", prompts["lead"], controller=True, repo=repo
+        ),
+        "__EXPLORER_COMMAND__": codex_cmd(
+            args.codex_worker_model, "low", prompts["explorer"], controller=False, repo=repo
+        ),
         "__REVIEWER_COMMAND__": claude_cmd(args.claude_worker_model, "medium", prompts["reviewer"], controller=False),
-        "__TESTER_COMMAND__": codex_cmd(args.codex_worker_model, "low", prompts["tester"], controller=False),
+        "__TESTER_COMMAND__": codex_cmd(
+            args.codex_worker_model, "low", prompts["tester"], controller=False, repo=repo
+        ),
         "__COMPARATOR_COMMAND__": claude_cmd(args.claude_worker_model, "medium", prompts["comparator"], controller=False),
     }
     layout = json.loads(TEMPLATE.read_text())
@@ -214,7 +233,9 @@ def orchestrator_layout(
             "The helper performs authenticated, atomic, one-way sealing. Do not write a result directly into its root."
         )
     if kind == "codex":
-        launched = codex_cmd(args.codex_orchestrator_model, "high", prompt, controller=True)
+        launched = codex_cmd(
+            args.codex_orchestrator_model, "high", prompt, controller=True, repo=repo
+        )
     else:
         launched = claude_cmd(args.claude_orchestrator_model, "high", prompt, controller=True)
     return {"pane": {"surfaces": [{"type": "terminal", "name": f"{kind}-orchestrator", "command": launched}]}}

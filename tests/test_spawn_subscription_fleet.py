@@ -9,6 +9,8 @@ import unittest
 import uuid
 from pathlib import Path
 
+from scripts import spawn_subscription_fleet as fleet
+
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "scripts" / "spawn_subscription_fleet.py"
@@ -18,7 +20,7 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.base = Path(self.tempdir.name)
-        self.repo = self.base / "target"
+        self.repo = self.base / "target repository"
         self.repo.mkdir()
         self._git("init", "-q")
         (self.repo / "tracked.txt").write_text("baseline\n", encoding="utf-8")
@@ -88,6 +90,22 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
         self.assertEqual(artifacts, [])
         self.assertFalse((team_root / "sealed-results" / project).exists())
 
+    def _assert_codex_repo_binding(self, value: str) -> None:
+        parts = shlex.split(value)
+        self.assertEqual(Path(parts[0]).name, "codex")
+        self.assertEqual(parts[parts.index("-C") + 1], str(self.repo.resolve()))
+        config_values = [parts[index + 1] for index, part in enumerate(parts[:-1]) if part == "-c"]
+        expected = f'projects.{json.dumps(str(self.repo.resolve()))}.trust_level="trusted"'
+        self.assertIn(expected, config_values)
+        self.assertNotIn("OPENAI_API_KEY", value)
+
+    def _assert_claude_unchanged(self, value: str) -> None:
+        parts = shlex.split(value)
+        self.assertEqual(Path(parts[0]).name, "claude")
+        self.assertNotIn("-C", parts)
+        self.assertFalse(any("trust_level" in part for part in parts))
+        self.assertNotIn("ANTHROPIC_API_KEY", value)
+
     def test_mirrored_dry_run_accepts_inline_task_and_task_file(self) -> None:
         task_file = self.base / "task.txt"
         task_file.write_text("Inspect the same immutable evidence.\n", encoding="utf-8")
@@ -120,6 +138,8 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
                 self.assertEqual(self._command_topology(claude_orchestrator)[0], "claude")
                 self.assertIn(expected_task, codex_orchestrator)
                 self.assertIn(expected_task, claude_orchestrator)
+                self._assert_codex_repo_binding(codex_orchestrator)
+                self._assert_claude_unchanged(claude_orchestrator)
 
                 self.assertEqual(set(plan["commands"]["codex"]), set(plan["commands"]["claude"]))
                 for role in plan["commands"]["codex"]:
@@ -127,6 +147,12 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
                         self._command_topology(plan["commands"]["codex"][role]),
                         self._command_topology(plan["commands"]["claude"][role]),
                     )
+                for team_commands in plan["commands"].values():
+                    for command_value in team_commands.values():
+                        if Path(shlex.split(command_value)[0]).name == "codex":
+                            self._assert_codex_repo_binding(command_value)
+                        else:
+                            self._assert_claude_unchanged(command_value)
 
                 shared = plan["envelope"]
                 shared_text = json.dumps(shared, sort_keys=True)
@@ -190,6 +216,21 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
         self.assertIn("layout", plan)
         self.assertIn("commands", plan)
         self.assertFalse(plan["provider_api_keys_injected"])
+        for value in plan["commands"].values():
+            if Path(shlex.split(value)[0]).name == "codex":
+                self._assert_codex_repo_binding(value)
+            else:
+                self._assert_claude_unchanged(value)
+
+        args = fleet.parser().parse_args([])
+        codex_orchestrator = fleet.orchestrator_layout(
+            args, self.repo, self.project, "codex"
+        )["pane"]["surfaces"][0]["command"]
+        claude_orchestrator = fleet.orchestrator_layout(
+            args, self.repo, self.project, "claude"
+        )["pane"]["surfaces"][0]["command"]
+        self._assert_codex_repo_binding(codex_orchestrator)
+        self._assert_claude_unchanged(claude_orchestrator)
         self._assert_no_artifacts(self.project)
 
     def test_snapshot_digest_changes_with_untracked_file_content(self) -> None:
