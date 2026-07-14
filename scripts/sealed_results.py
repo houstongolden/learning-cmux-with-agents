@@ -58,6 +58,10 @@ class DeadlineExceededError(SealedResultsError):
     """Raised when a model result attempts to submit outside its timebox."""
 
 
+class RunInvalidatedError(SealedResultsError):
+    """Raised when an operation targets a coordinator-invalidated run."""
+
+
 def canonical_json(value: Any) -> bytes:
     """Return a stable UTF-8 JSON representation suitable for hashing."""
 
@@ -103,6 +107,10 @@ def _contract_path(root: Path) -> Path:
 
 def _result_path(root: Path, team: str) -> Path:
     return root / "results" / f"{team}.json"
+
+
+def _invalidation_path(root: Path) -> Path:
+    return root / "invalidated.json"
 
 
 def _write_bytes_and_sync(fd: int, data: bytes) -> None:
@@ -239,6 +247,77 @@ def _load_contract(root: Path) -> dict[str, Any]:
     return contract
 
 
+def invalidation_status(root: Path) -> dict[str, Any] | None:
+    """Return immutable coordinator invalidation metadata, if present."""
+
+    path = _invalidation_path(Path(root))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SealedResultsError(f"invalid run-invalidation record at {path}") from exc
+    required = {
+        "schema_version",
+        "result_type",
+        "reason_code",
+        "message",
+        "invalidated_at_utc",
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != required
+        or payload.get("schema_version") != SCHEMA_VERSION
+        or payload.get("result_type") != "run_invalidation"
+        or not isinstance(payload.get("reason_code"), str)
+        or not payload["reason_code"]
+        or not isinstance(payload.get("message"), str)
+        or not payload["message"]
+        or not isinstance(payload.get("invalidated_at_utc"), str)
+    ):
+        raise SealedResultsError(f"malformed run-invalidation record at {path}")
+    parse_utc_timestamp(payload["invalidated_at_utc"])
+    return payload
+
+
+def _ensure_active(root: Path) -> None:
+    invalidation = invalidation_status(root)
+    if invalidation is not None:
+        raise RunInvalidatedError(
+            "sealed-results run was invalidated: "
+            f"{invalidation['reason_code']}: {invalidation['message']}"
+        )
+
+
+def invalidate(
+    root: Path,
+    reason_code: str,
+    message: str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Atomically and permanently invalidate one sealed-results run."""
+
+    root = Path(root)
+    _load_contract(root)
+    reason_code = reason_code.strip()
+    message = message.strip()
+    if not reason_code or not message:
+        raise SealedResultsError("invalidation reason code and message must be non-empty")
+    clock = now or datetime.now(timezone.utc)
+    if clock.tzinfo is None:
+        raise SealedResultsError("invalidation clock must be timezone-aware")
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "result_type": "run_invalidation",
+        "reason_code": reason_code,
+        "message": message,
+        "invalidated_at_utc": utc_timestamp(clock),
+    }
+    _write_once(_invalidation_path(root), canonical_json(payload))
+    return payload
+
+
 def submit(
     root: Path,
     team: str,
@@ -251,6 +330,7 @@ def submit(
 
     root = Path(root)
     contract = _load_contract(root)
+    _ensure_active(root)
     expected_hash = contract["capability_sha256"].get(team)
     supplied_hash = sha256_hex(capability.encode("utf-8"))
     if not isinstance(expected_hash, str) or not hmac.compare_digest(expected_hash, supplied_hash):
@@ -282,7 +362,11 @@ def submit(
     }
     sealed = canonical_json(envelope)
     path = _result_path(root, team)
-    _write_once(path, sealed, before_publish=enforce_deadline)
+    def enforce_active_deadline() -> None:
+        _ensure_active(root)
+        enforce_deadline()
+
+    _write_once(path, sealed, before_publish=enforce_active_deadline)
     return {
         "team": team,
         "sha256": sha256_hex(sealed),
@@ -296,6 +380,16 @@ def status(root: Path) -> dict[str, Any]:
 
     root = Path(root)
     contract = _load_contract(root)
+    invalidation = invalidation_status(root)
+    if invalidation is not None:
+        return {
+            "valid": False,
+            "ready": False,
+            "missing": list(contract["expected_teams"]),
+            "results": {},
+            "invalidation": invalidation,
+            "security_boundary": SECURITY_BOUNDARY,
+        }
     results: dict[str, Any] = {}
     missing: list[str] = []
     for team in contract["expected_teams"]:
@@ -328,12 +422,26 @@ def status(root: Path) -> dict[str, Any]:
                     }
                 )
         results[team] = entry
-    return {
+    active_status = {
+        "valid": True,
         "ready": not missing,
         "missing": missing,
         "results": results,
         "security_boundary": SECURITY_BOUNDARY,
     }
+    # Linearize active status after all result metadata reads. If invalidation
+    # raced with them, the typed invalid state dominates the response.
+    invalidation = invalidation_status(root)
+    if invalidation is not None:
+        return {
+            "valid": False,
+            "ready": False,
+            "missing": list(contract["expected_teams"]),
+            "results": {},
+            "invalidation": invalidation,
+            "security_boundary": SECURITY_BOUNDARY,
+        }
+    return active_status
 
 
 def expire(
@@ -348,6 +456,7 @@ def expire(
 
     root = Path(root)
     contract = _load_contract(root)
+    _ensure_active(root)
     if team not in contract["expected_teams"]:
         raise SealedResultsError(f"team is not part of this contract: {team}")
     deadline_value = contract.get("deadline_utc")
@@ -378,7 +487,7 @@ def expire(
     }
     sealed = canonical_json(envelope)
     path = _result_path(root, team)
-    _write_once(path, sealed)
+    _write_once(path, sealed, before_publish=lambda: _ensure_active(root))
     return {
         "team": team,
         "result_type": "infrastructure_failure",
@@ -393,6 +502,12 @@ def reveal(root: Path) -> dict[str, Any]:
 
     root = Path(root)
     readiness = status(root)
+    if readiness.get("valid") is False:
+        invalidation = readiness["invalidation"]
+        raise RunInvalidatedError(
+            "sealed-results run was invalidated: "
+            f"{invalidation['reason_code']}: {invalidation['message']}"
+        )
     if not readiness["ready"]:
         raise NotReadyError(readiness["missing"])
 
@@ -425,6 +540,9 @@ def reveal(root: Path) -> dict[str, Any]:
             }
         else:
             raise SealedResultsError(f"sealed result for {team} has unknown type {result_type!r}")
+    # Treat this check as reveal's active-run linearization point. Invalidation
+    # observed after result reads still dominates and prevents payload release.
+    _ensure_active(root)
     return {"ready": True, "results": revealed, "security_boundary": SECURITY_BOUNDARY}
 
 

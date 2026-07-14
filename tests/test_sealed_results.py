@@ -290,6 +290,101 @@ class SealedResultsTests(unittest.TestCase):
             "infrastructure_failure",
         )
 
+    def test_invalidation_blocks_operations_and_status_exposes_no_payload(self) -> None:
+        sealed_results.submit(
+            self.root,
+            "sol",
+            self.tokens["sol"],
+            {"secret": "must remain sealed"},
+        )
+        invalidated_at = datetime(2042, 3, 4, 5, 6, 7, tzinfo=timezone.utc)
+        metadata = sealed_results.invalidate(
+            self.root,
+            "readiness_failed",
+            "one child exited after the launch barrier",
+            now=invalidated_at,
+        )
+        self.assertEqual(metadata["result_type"], "run_invalidation")
+        self.assertEqual(metadata["invalidated_at_utc"], "2042-03-04T05:06:07Z")
+        self.assertEqual(sealed_results.invalidation_status(self.root), metadata)
+
+        status = sealed_results.status(self.root)
+        self.assertFalse(status["valid"])
+        self.assertFalse(status["ready"])
+        self.assertEqual(status["invalidation"], metadata)
+        self.assertEqual(status["results"], {})
+        self.assertNotIn("payload", json.dumps(status))
+        self.assertNotIn("must remain sealed", json.dumps(status))
+
+        with self.assertRaises(sealed_results.RunInvalidatedError):
+            sealed_results.submit(
+                self.root,
+                "opus",
+                self.tokens["opus"],
+                {"verdict": "late"},
+            )
+        with self.assertRaises(sealed_results.RunInvalidatedError):
+            sealed_results.expire(
+                self.root,
+                "opus",
+                "provider_quota",
+                "must not publish",
+            )
+        with self.assertRaises(sealed_results.RunInvalidatedError):
+            sealed_results.reveal(self.root)
+
+    def test_duplicate_invalidation_is_refused_without_replacement(self) -> None:
+        first = sealed_results.invalidate(self.root, "first", "original reason")
+        with self.assertRaises(sealed_results.AlreadySubmittedError):
+            sealed_results.invalidate(self.root, "second", "replacement reason")
+        self.assertEqual(sealed_results.invalidation_status(self.root), first)
+
+    def test_invalidation_during_submit_dominates_and_prevents_reveal(self) -> None:
+        staged = threading.Event()
+        release = threading.Event()
+        failures: list[BaseException] = []
+
+        original_write = sealed_results._write_bytes_and_sync
+
+        def stage_then_release(fd: int, data: bytes) -> None:
+            original_write(fd, data)
+            if threading.current_thread() is threading.main_thread():
+                return
+            staged.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("test did not release staged invalidated result")
+
+        def writer() -> None:
+            try:
+                sealed_results.submit(
+                    self.root,
+                    "sol",
+                    self.tokens["sol"],
+                    {"secret": "racing payload"},
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+        with mock.patch.object(
+            sealed_results,
+            "_write_bytes_and_sync",
+            side_effect=stage_then_release,
+        ):
+            thread = threading.Thread(target=writer, name="racing-sealed-submit")
+            thread.start()
+            self.assertTrue(staged.wait(timeout=5))
+            sealed_results.invalidate(self.root, "readiness_failed", "coordinator rollback")
+            release.set()
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], sealed_results.RunInvalidatedError)
+        self.assertFalse((self.root / "results" / "sol.json").exists())
+        self.assertFalse(sealed_results.status(self.root)["valid"])
+        with self.assertRaises(sealed_results.RunInvalidatedError):
+            sealed_results.reveal(self.root)
+
 
 if __name__ == "__main__":
     unittest.main()
