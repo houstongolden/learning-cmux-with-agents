@@ -1,0 +1,321 @@
+# Setup
+
+## 1. Install and open cmux
+
+```bash
+brew tap manaflow-ai/cmux
+brew install --cask cmux
+open -a cmux
+```
+
+If `cmux` is not on `PATH` outside the app, link the bundled CLI:
+
+```bash
+ln -sf /Applications/cmux.app/Contents/Resources/bin/cmux /opt/homebrew/bin/cmux
+```
+
+On an Intel/Homebrew or locked `/opt/homebrew/bin` installation, use a writable
+directory already on `PATH`; `/usr/local/bin/cmux` with `sudo ln -sf ...` is a
+fallback, not the preferred Apple Silicon path.
+
+Open **cmux Settings -> Automation** and allow socket control for the terminal
+that will run the orchestrator. The launcher checks `cmux identify --json` and
+will open cmux automatically, but it does not silently weaken automation
+settings.
+
+Install completion hooks so the lead can wait on events instead of aggressively
+polling panes:
+
+```bash
+cmux hooks setup --agent codex --yes
+```
+
+Claude Code's cmux integration is injected by cmux and does not need a separate
+hook install.
+
+## 2. Use subscription logins, not API keys
+
+Sign Codex into ChatGPT:
+
+```bash
+codex login
+codex login status
+```
+
+Sign Claude Code into Claude.ai:
+
+```bash
+claude auth login
+claude auth status
+```
+
+Sign into You.md for cross-agent messages and mutation claims:
+
+```bash
+youmd login
+youmd whoami
+```
+
+The launcher deliberately does not pass `--env-file`, inspect `.env`, or read
+provider API keys. Every generated Codex/Claude command explicitly unsets known
+provider API-key and alternate-routing variables before starting the CLI, while
+preserving subscription OAuth/keychain state. Spawn receipts label this
+`cli_subscription`; the launcher makes no direct usage-billed provider API
+request. This prevents an inherited `OPENAI_API_KEY` from silently switching a
+Codex worker onto separate API billing.
+
+### Codex project trust is per invocation
+
+Do not assume Codex will inherit trust for an exact checkout merely because its
+parent directory is trusted. The first mirrored run stalled on that prompt at
+the 20-minute mark, so it is diagnostic-only and must not be reported as a clean
+orchestrator comparison.
+
+The launcher now builds every Codex invocation with the resolved target path:
+
+```bash
+codex -C /absolute/path/to/repo \
+  -c 'projects."/absolute/path/to/repo".trust_level="trusted"' ...
+```
+
+This scopes the override to that process, avoids the interactive trust stall,
+and does not edit `~/.codex/config.toml`. The mirrored rerun must start two fresh
+arms; do not resume the trust-stalled sessions.
+
+## 3. Validate without launching anything
+
+From this repository:
+
+```bash
+python3 scripts/spawn_subscription_fleet.py --validate
+```
+
+This validates the layout schema and checks that `cmux`, `codex`, `claude`,
+`youmd`, and `git` are present. It neither opens cmux nor calls a model.
+
+Then render a project-specific plan:
+
+```bash
+python3 scripts/spawn_subscription_fleet.py \
+  --repo /Users/houstongolden/Desktop/CODE_YOU/bigbounce \
+  --project p3-review-round \
+  --dry-run
+```
+
+Dry-run prints the final layout, model routing, primary command, comparison
+command, and (for mutation mode) proposed worktrees. It performs no writes,
+does not acquire a claim, and does not start model sessions.
+
+## 4. Start one read-only fleet
+
+```bash
+python3 scripts/spawn_subscription_fleet.py \
+  --repo /Users/houstongolden/Desktop/CODE_YOU/bigbounce \
+  --project p3-review-round
+```
+
+The default primary orchestrator is:
+
+```bash
+codex -m gpt-5.6-sol -c 'model_reasoning_effort="high"' ...
+```
+
+To run the same topology with the Anthropic comparison orchestrator:
+
+```bash
+python3 scripts/spawn_subscription_fleet.py \
+  --repo /absolute/path/to/repo \
+  --project feature-name \
+  --orchestrator claude
+```
+
+That launches `claude --model claude-fable-5 --effort high` as an independent
+checkpoint/comparison director. Claude is not used for routine worker panes.
+The exact model IDs are flags, so account-specific aliases can be supplied
+without editing the template:
+
+```bash
+python3 scripts/spawn_subscription_fleet.py \
+  --repo /absolute/path/to/repo \
+  --project feature-name \
+  --codex-orchestrator-model gpt-5.6-sol \
+  --codex-lead-model gpt-5.6-terra \
+  --codex-worker-model gpt-5.6-luna \
+  --codex-tester-model gpt-5.3-codex-spark \
+  --claude-orchestrator-model claude-fable-5
+```
+
+## 5. Run a mirrored A/B comparison
+
+Put the exact task in a UTF-8 file, then let the launcher generate the immutable
+envelope and both arms in one operation:
+
+```bash
+python3 scripts/spawn_subscription_fleet.py \
+  --repo /absolute/path/to/repo \
+  --project feature-ab \
+  --mirrored \
+  --task-file /absolute/path/to/task.md \
+  --timeout-minutes 20 \
+  --route-probe-timeout-seconds 60 \
+  --readiness-timeout-seconds 30 \
+  --readiness-settle-seconds 1.0
+```
+
+All four timing flags are optional. `--timeout-minutes` defaults to `20` and
+sets the result deadline; `--route-probe-timeout-seconds` defaults to `60` per
+unique provider/model/effort route; `--readiness-timeout-seconds` defaults to
+`30` for collecting every child receipt; `--readiness-settle-seconds` defaults
+to `1.0` for detecting immediate post-receipt exits.
+
+The envelope binds the task to repository HEAD, the tracked staged+unstaged
+binary diff, and an ordered untracked path/type/mode/content-or-symlink-target
+hash manifest. If the checkout changes after envelope creation, invalidate the
+run.
+
+Start two fresh fleet workspaces from that same envelope:
+
+- arm A: Codex `gpt-5.6-sol`, high-effort orchestrator;
+- arm B: Claude `claude-fable-5`, high-effort orchestrator;
+- both: equivalent lead/worker prompt templates and identical models, tools,
+  permissions, time budget, and acceptance commands.
+
+The launcher embeds the full task in both orchestrator startup commands. The
+lead and four workers receive the same envelope path/hash in their startup
+prompts, then wait for their own orchestrator/lead to dispatch the task. Do not
+depend on outside-terminal `send` for initial orchestrator delivery. Each
+orchestrator prepares a JSON payload and submits it through
+`scripts/sealed_results.py submit`; it must not write directly into the sealed
+root. Each plaintext capability is stored in its owning mode-`0400` token file
+and passed with `--token-file`; it is never placed in argv. The shared task
+envelope and spawn receipt contain only capability hashes.
+
+Copy the nested `sealed_results.root` path printed by the launcher, then observe
+without revealing payloads:
+
+```bash
+SEALED_ROOT=/absolute/path/printed/by/the/launcher
+python3 scripts/sealed_results.py status --root "$SEALED_ROOT"
+```
+
+Reveal is fail-closed until both submissions exist:
+
+```bash
+python3 scripts/sealed_results.py reveal --root "$SEALED_ROOT"
+```
+
+If one arm is still missing after the contract deadline, seal a typed
+infrastructure failure into that arm's empty slot:
+
+```bash
+python3 scripts/sealed_results.py expire \
+  --root "$SEALED_ROOT" \
+  --team claude \
+  --reason-code provider_subscription_limit \
+  --message "Weekly subscription limit prevented completion before deadline"
+```
+
+`expire` refuses to run before the stored deadline, refuses contracts without a
+deadline, and cannot replace an existing submission. Model submissions at or
+after the deadline are rejected. After expiration, `status` is ready and
+`reveal` returns the real result beside a typed `infrastructure_failure`; that is
+an adjudication record, not a model loss.
+
+### Provider-route and four-workspace readiness barriers
+
+Before creating CMUX workspaces, the launcher completes one minimal model turn
+for each unique provider/model/effort route. These one-shot probes use the
+existing `codex login` and Claude subscription sessions. Both probes and live
+surface commands remove provider API-key, alternate-base-URL,
+Bedrock/Vertex/Foundry, and related cloud credential/routing variables while
+preserving subscription OAuth and keychain state. Probes run in fresh empty
+directories with read-only or disabled-tool configuration and no session
+persistence. Provider CLIs are resolved to
+absolute paths, and their executable content digests are checked after the
+turn. The response must be the bare run-bound sentinel, sentinel plus one LF,
+or sentinel plus one CRLF. Probe output is deleted. The immutable receipt contains only hashes
+binding the run, route, repository snapshot, command, executable content, and
+sentinel plus a UTC completion time. Reused routes are deduplicated.
+
+A timeout, nonzero exit, provider error, malformed output, or sentinel mismatch
+fails closed. The coordinator invalidates the sealed contract before release
+and creates zero CMUX workspaces.
+
+The mirrored launcher now places both team workspaces and both orchestrator
+workspaces behind one shared filesystem gate. No agent command starts until
+cmux reports all four expected workspace refs, names, and terminal surface
+topologies. The launcher publishes the gate atomically without replacement.
+
+Every released surface then authenticates through its subscription CLI, starts
+under a supervisor, survives a short liveness check, and writes an immutable
+receipt bound to run, team, role, workspace ref, surface ref, and repository
+snapshot. The launcher requires all receipts within the readiness timeout and
+then rejects exit markers during the settle window. The earlier route probes
+prove a completed turn and quota availability for each unique route at launch;
+this surface phase proves that each interactive process authenticated and
+started. It does not prove a completed turn for every interactive surface or
+continued quota availability after launch.
+
+Every run-owned surface process tree is wrapped in macOS Seatbelt and denied
+target-repository writes. Raw CMUX surfaces and separately launched same-user
+processes remain outside that boundary.
+
+On creation, topology, or readiness failure, the launcher atomically invalidates
+the sealed contract before closing run-owned workspaces in reverse order.
+Supervisors monitor invalidation and TERM/KILL their complete process groups.
+The invalid receipt records every failed close; invalidated contracts cannot
+submit, expire, or reveal a raced late result.
+
+Remediation tests currently pass `37/37` across sealing, route-turn probes,
+hash-only receipts, pre-release invalidation with zero workspaces, invalidation
+races, trust, Seatbelt enforcement, topology, bound surface readiness,
+early-exit settlement, process-group termination, no-replace gate release, and
+scoped rollback.
+
+The exact envelope, submission, and scoring contracts are in
+[MIRRORED-AB-PROTOCOL.md](MIRRORED-AB-PROTOCOL.md).
+
+## 6. Mutation is intentionally blocked today
+
+The command exists to prove the guardrail:
+
+```bash
+python3 scripts/spawn_subscription_fleet.py \
+  --repo /absolute/path/to/repo \
+  --project feature-name \
+  --mode mutate
+```
+
+It exits before creating sessions or worktrees. The current You.md agent bus
+provides durable coordination messages, not a server-atomic compare-and-set
+lease. The atomic API and isolated-worktree rollout needed to enable mutation
+are specified in [ENDPOINTS.md](ENDPOINTS.md).
+
+## Remaining acceptance blockers
+
+- a run-scoped CMUX broker or stronger hostile-model isolation;
+- one fresh clean mirrored rerun after the Claude subscription reset.
+
+## Verified cmux 0.64.17 caveat on this host
+
+On macOS 26.5, external `allowAll` socket control created workspaces but repeated
+`send` and `read-screen` calls timed out and required a cmux restart. This
+launcher therefore boots commands declaratively and puts both orchestrator and
+team inside cmux. In-cmux wrappers and native `cmux codex-teams` /
+`cmux claude-teams` are the safe fallback. Treat outside-terminal screen driving
+as unverified until a cmux update and diagnostics pass prove it again.
+
+## Troubleshooting
+
+- `cmux failed to start`: open the app and check **Settings -> Automation**.
+- `model not available`: pass the account-visible model ID with the matching
+  `--*-model` flag; do not add a provider key.
+- Codex shows a trust prompt: stop that arm and confirm the generated command
+  contains exact matching `-C` and `projects."<repo>".trust_level="trusted"`
+  values; do not click through and count the run as comparable.
+- worker stops for permissions: keep the default read-only mode, or use mutation
+  mode so each worker gets a writable worktree.
+- duplicate work detected: stop before dispatching, inspect the claim message
+  and the related branch/PR, then choose a non-overlapping scope.
+- stale claim: wait for its expiry or ask the owning agent to post a release;
+  never impersonate the owner.
