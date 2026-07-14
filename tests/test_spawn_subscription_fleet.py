@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 import uuid
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -219,6 +220,11 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
                 self.assertEqual(set(plan["orchestrator_layouts"]), {"codex", "claude"})
                 self.assertEqual(set(plan["orchestrators"]), {"codex", "claude"})
                 self.assertEqual(plan["envelope"]["task"], expected_task)
+                self.assertEqual(plan["envelope"]["timeout_minutes"], 20)
+                self.assertEqual(
+                    plan["envelope"]["deadline_utc"],
+                    plan["envelope"]["sealed_results"]["deadline_utc"],
+                )
                 self.assertFalse(plan["provider_api_keys_injected"])
 
                 codex_orchestrator = plan["orchestrator_layouts"]["codex"]["pane"]["surfaces"][0]["command"]
@@ -258,6 +264,37 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
                         for value in shared["sealed_results"]["capability_sha256"].values()
                     )
                 )
+
+    def test_mirrored_timeout_is_positive_and_recorded_as_utc_deadline(self) -> None:
+        plan = self._dry_run(
+            "--task",
+            "Bound this comparison.",
+            "--timeout-minutes",
+            "7",
+        )
+        envelope = plan["envelope"]
+        created = datetime.fromisoformat(envelope["created_at_utc"].replace("Z", "+00:00"))
+        deadline = datetime.fromisoformat(envelope["deadline_utc"].replace("Z", "+00:00"))
+        self.assertEqual((deadline - created).total_seconds(), 7 * 60)
+        self.assertEqual(envelope["timeout_minutes"], 7)
+        self.assertEqual(envelope["sealed_results"]["deadline_utc"], envelope["deadline_utc"])
+
+        for invalid in ("0", "-1", "not-a-number"):
+            with self.subTest(invalid=invalid):
+                result = self._run(
+                    "--repo",
+                    str(self.repo),
+                    "--project",
+                    self.project,
+                    "--mirrored",
+                    "--task",
+                    "Bound this comparison.",
+                    "--timeout-minutes",
+                    invalid,
+                    "--dry-run",
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("timeout minutes", result.stderr)
 
     def test_mirrored_requires_nonempty_task(self) -> None:
         for task_args in ((), ("--task", "")):

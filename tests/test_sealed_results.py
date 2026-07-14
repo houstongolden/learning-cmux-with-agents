@@ -3,9 +3,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -154,6 +157,138 @@ class SealedResultsTests(unittest.TestCase):
             {"attempt": 2},
         )
         self.assertEqual(len(receipt["sha256"]), 64)
+
+    def test_deadline_expiration_pairs_real_result_with_infrastructure_failure(self) -> None:
+        root = Path(self.tempdir.name) / "deadline-contract"
+        deadline = datetime(2035, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        initialized = sealed_results.initialize(
+            root,
+            ("sol", "opus"),
+            deadline_utc=deadline,
+        )
+        tokens = initialized["capabilities"]
+        contract = json.loads((root / "contract.json").read_text(encoding="utf-8"))
+        self.assertEqual(contract["deadline_utc"], "2035-01-02T03:04:05Z")
+        sealed_results.submit(root, "sol", tokens["sol"], {"verdict": "pass"})
+
+        with self.assertRaises(sealed_results.DeadlineNotReachedError):
+            sealed_results.expire(
+                root,
+                "opus",
+                "provider_quota",
+                "Claude weekly limit reached",
+                now=deadline - timedelta(seconds=1),
+            )
+        self.assertEqual(sealed_results.status(root)["missing"], ["opus"])
+
+        receipt = sealed_results.expire(
+            root,
+            "opus",
+            "provider_quota",
+            "Claude weekly limit reached",
+            now=deadline,
+        )
+        self.assertEqual(receipt["result_type"], "infrastructure_failure")
+        status = sealed_results.status(root)
+        self.assertTrue(status["ready"])
+        self.assertEqual(status["results"]["opus"]["result_type"], "infrastructure_failure")
+        self.assertTrue(status["results"]["opus"]["expired"])
+        self.assertNotIn("payload", json.dumps(status))
+
+        revealed = sealed_results.reveal(root)
+        self.assertEqual(revealed["results"]["sol"]["result_type"], "model_result")
+        self.assertEqual(revealed["results"]["sol"]["payload"], {"verdict": "pass"})
+        failure = revealed["results"]["opus"]
+        self.assertEqual(failure["result_type"], "infrastructure_failure")
+        self.assertEqual(failure["infrastructure_failure"]["reason_code"], "provider_quota")
+        self.assertNotIn("payload", failure)
+        self.assertNotIn("verdict", json.dumps(failure))
+
+        with self.assertRaises(sealed_results.AlreadySubmittedError):
+            sealed_results.expire(
+                root,
+                "opus",
+                "other",
+                "must not overwrite",
+                now=deadline + timedelta(minutes=1),
+            )
+        with self.assertRaises(sealed_results.AlreadySubmittedError):
+            sealed_results.submit(root, "opus", tokens["opus"], {"verdict": "late"})
+
+    def test_expire_cli_publishes_typed_marker_after_deadline(self) -> None:
+        root = Path(self.tempdir.name) / "cli-deadline-contract"
+        sealed_results.initialize(
+            root,
+            ("sol", "opus"),
+            deadline_utc="2000-01-01T00:00:00Z",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(MODULE_PATH),
+                "expire",
+                "--root",
+                str(root),
+                "--team",
+                "opus",
+                "--reason-code",
+                "provider_quota",
+                "--message",
+                "weekly subscription limit",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(result.stdout)
+        self.assertEqual(receipt["result_type"], "infrastructure_failure")
+        raw_marker = (root / "results" / "opus.json").read_text(encoding="utf-8")
+        self.assertNotIn('"payload"', raw_marker)
+        self.assertNotIn('"verdict"', raw_marker)
+
+    def test_deadline_rejects_late_model_submit_and_preserves_expiration_slot(self) -> None:
+        root = Path(self.tempdir.name) / "submission-deadline-contract"
+        deadline = datetime(2040, 6, 7, 8, 9, 10, tzinfo=timezone.utc)
+        initialized = sealed_results.initialize(
+            root,
+            ("sol", "opus"),
+            deadline_utc=deadline,
+        )
+        tokens = initialized["capabilities"]
+
+        sealed_results.submit(
+            root,
+            "sol",
+            tokens["sol"],
+            {"verdict": "on time"},
+            now=deadline - timedelta(microseconds=1),
+        )
+        for late_clock in (deadline, deadline + timedelta(seconds=1)):
+            with self.subTest(late_clock=late_clock):
+                with self.assertRaisesRegex(
+                    sealed_results.DeadlineExceededError,
+                    "at or after deadline",
+                ):
+                    sealed_results.submit(
+                        root,
+                        "opus",
+                        tokens["opus"],
+                        {"verdict": "must not publish"},
+                        now=late_clock,
+                    )
+                self.assertFalse((root / "results" / "opus.json").exists())
+
+        sealed_results.expire(
+            root,
+            "opus",
+            "timebox_elapsed",
+            "orchestrator did not submit before its deadline",
+            now=deadline,
+        )
+        self.assertEqual(
+            sealed_results.reveal(root)["results"]["opus"]["result_type"],
+            "infrastructure_failure",
+        )
 
 
 if __name__ == "__main__":

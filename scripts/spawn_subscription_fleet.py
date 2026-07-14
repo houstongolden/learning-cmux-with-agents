@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -61,6 +62,16 @@ def sha256(value: bytes | str) -> str:
     if isinstance(value, str):
         value = value.encode()
     return hashlib.sha256(value).hexdigest()
+
+
+def positive_minutes(value: str) -> int:
+    try:
+        minutes = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("timeout minutes must be an integer") from exc
+    if minutes <= 0:
+        raise argparse.ArgumentTypeError("timeout minutes must be positive")
+    return minutes
 
 
 def codex_cmd(
@@ -539,6 +550,12 @@ def parser() -> argparse.ArgumentParser:
     task = p.add_mutually_exclusive_group()
     task.add_argument("--task-file", type=Path, help="UTF-8 file containing the immutable comparison task")
     task.add_argument("--task", help="immutable comparison task (prefer --task-file for non-trivial prompts)")
+    p.add_argument(
+        "--timeout-minutes",
+        type=positive_minutes,
+        default=20,
+        help="mirrored team deadline in minutes (default: 20)",
+    )
     p.add_argument("--codex-orchestrator-model", default="gpt-5.6-sol")
     p.add_argument("--claude-orchestrator-model", default="claude-opus-4-8")
     p.add_argument("--codex-lead-model", default="gpt-5.6-sol")
@@ -664,8 +681,12 @@ def main() -> None:
     if args.mirrored:
         snapshot = repo_snapshot(repo)
         task_digest = sha256(task or "")
+        created_at = datetime.now(timezone.utc).replace(microsecond=0)
+        deadline = created_at + timedelta(minutes=args.timeout_minutes)
+        created_at_utc = sealed_results.utc_timestamp(created_at)
+        deadline_utc = sealed_results.utc_timestamp(deadline)
         run_id = (
-            f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-"
+            f"{created_at.strftime('%Y%m%dT%H%M%SZ')}-"
             f"{time.time_ns() % 1_000_000_000:09d}-{task_digest[:12]}"
         )
         envelope_path = ROOT / ".team" / f"{project}.{run_id}.task-envelope.json"
@@ -681,11 +702,16 @@ def main() -> None:
                 "capability_sha256": {
                     kind: sha256(capabilities[kind]) for kind in sorted(teams)
                 },
+                "deadline_utc": deadline_utc,
                 "security_boundary": sealed_results.SECURITY_BOUNDARY,
             }
             contract_bytes = sealed_results.canonical_json(contract)
         else:
-            initialized = sealed_results.initialize(seal_root, teams)
+            initialized = sealed_results.initialize(
+                seal_root,
+                teams,
+                deadline_utc=deadline_utc,
+            )
             capabilities = initialized["capabilities"]
             contract_bytes = (seal_root / "contract.json").read_bytes()
             contract = json.loads(contract_bytes)
@@ -694,12 +720,15 @@ def main() -> None:
             "security_boundary": sealed_results.SECURITY_BOUNDARY,
             "contract_sha256": sha256(contract_bytes),
             "capability_sha256": contract["capability_sha256"],
+            "deadline_utc": contract["deadline_utc"],
         }
         envelope = {
             "schema_version": 1,
             "immutable": True,
             "run_id": run_id,
-            "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "created_at_utc": created_at_utc,
+            "deadline_utc": deadline_utc,
+            "timeout_minutes": args.timeout_minutes,
             "mode": args.mode,
             "project": project,
             "repo": str(repo),
@@ -781,6 +810,8 @@ def main() -> None:
             "task_envelope_sha256": envelope_sha256,
             "target_snapshot": snapshot,
             "sealed_results": seal_metadata,
+            "deadline_utc": deadline_utc,
+            "timeout_minutes": args.timeout_minutes,
         }
         try:
             receipt = launch_mirrored_workspaces(
