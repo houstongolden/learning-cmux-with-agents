@@ -329,6 +329,309 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("timeout minutes", result.stderr)
 
+    def test_dry_run_exposes_deterministic_deduped_provider_routes(self) -> None:
+        plan = self._dry_run("--task", "Probe every route before launch.")
+        routes = plan["provider_route_readiness"]["planned_routes"]
+        self.assertEqual(routes, fleet.provider_routes(fleet.parser().parse_args([])))
+        self.assertEqual(len(routes), len({tuple(route.values()) for route in routes}))
+        self.assertEqual(
+            routes,
+            [
+                {"provider": "codex", "model": "gpt-5.6-sol", "effort": "medium"},
+                {"provider": "codex", "model": "gpt-5.6-sol", "effort": "low"},
+                {"provider": "claude", "model": "sonnet", "effort": "medium"},
+                {"provider": "codex", "model": "gpt-5.6-sol", "effort": "high"},
+                {"provider": "claude", "model": "claude-opus-4-8", "effort": "high"},
+            ],
+        )
+        self.assertEqual(plan["provider_route_readiness"]["timeout_seconds"], 60)
+
+    def test_provider_probe_commands_are_isolated_and_disable_api_key_env(self) -> None:
+        cwd = self.base / "empty"
+        cwd.mkdir()
+        output = self.base / "last-message"
+        codex_route = {"provider": "codex", "model": "codex-model", "effort": "low"}
+        claude_route = {"provider": "claude", "model": "claude-model", "effort": "medium"}
+        sentinel = "CMUX-ROUTE-READY:test"
+        observed_envs: list[dict[str, str]] = []
+
+        def fake_run(argv, **kwargs):
+            observed_envs.append(kwargs["env"])
+            self.assertEqual(kwargs["cwd"], cwd)
+            if len(argv) > 1 and argv[1] == "exec":
+                output.write_text(sentinel + "\n", encoding="utf-8")
+                return subprocess.CompletedProcess(argv, 0, "ignored stdout", "")
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"is_error": False, "result": sentinel}), ""
+            )
+
+        forbidden_environment = {name: "forbidden" for name in fleet.PROBE_ENV_DENYLIST}
+        forbidden_environment["CLAUDE_CODE_OAUTH_TOKEN"] = "retained-subscription-oauth"
+        with mock.patch.dict(os.environ, forbidden_environment), mock.patch.object(
+            fleet.subprocess, "run", side_effect=fake_run
+        ):
+            codex_argv, codex_result, codex_executable = fleet.execute_route_probe(
+                codex_route,
+                cwd=cwd,
+                output_path=output,
+                sentinel=sentinel,
+                timeout_seconds=3,
+            )
+            claude_argv, claude_result, claude_executable = fleet.execute_route_probe(
+                claude_route,
+                cwd=cwd,
+                output_path=output,
+                sentinel=sentinel,
+                timeout_seconds=3,
+            )
+
+        self.assertEqual(codex_result.strip(), sentinel)
+        self.assertEqual(claude_result, sentinel)
+        for forbidden in fleet.PROBE_ENV_DENYLIST:
+            self.assertTrue(all(forbidden not in env for env in observed_envs))
+        self.assertTrue(all(env["CLAUDE_CODE_OAUTH_TOKEN"] == "retained-subscription-oauth" for env in observed_envs))
+        self.assertTrue(Path(codex_argv[0]).is_absolute())
+        self.assertEqual(codex_argv[1], "exec")
+        self.assertEqual(codex_executable, fleet.sha256(Path(codex_argv[0]).read_bytes()))
+        self.assertEqual(claude_executable, fleet.sha256(Path(claude_argv[0]).read_bytes()))
+        for flag in (
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--sandbox",
+            "--output-last-message",
+        ):
+            self.assertIn(flag, codex_argv)
+        self.assertEqual(codex_argv[codex_argv.index("--sandbox") + 1], "read-only")
+        for flag in (
+            "-p",
+            "--output-format",
+            "--tools",
+            "--permission-mode",
+            "--no-session-persistence",
+            "--safe-mode",
+        ):
+            self.assertIn(flag, claude_argv)
+        self.assertEqual(claude_argv[claude_argv.index("--tools") + 1], "")
+        self.assertEqual(claude_argv[claude_argv.index("--permission-mode") + 1], "plan")
+
+    def test_route_probe_receipts_are_hash_only_immutable_and_deduped(self) -> None:
+        route = {"provider": "codex", "model": "secret-model-name", "effort": "high"}
+        root = self.base / "route-probes"
+        calls: list[str] = []
+
+        def fake_execute(_route, **kwargs):
+            calls.append(kwargs["sentinel"])
+            return ["/absolute/codex", "exec", "redacted-prompt"], kwargs["sentinel"], "1" * 64
+
+        with mock.patch.object(fleet, "execute_route_probe", side_effect=fake_execute):
+            receipts = fleet.run_route_probes(
+                [route, dict(route)],
+                root=root,
+                run_id="run-secret",
+                snapshot_sha256="e" * 64,
+                timeout_seconds=5,
+            )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(receipts), 1)
+        receipt = receipts[0]
+        serialized = json.dumps(receipt)
+        for raw in ("codex", "secret-model-name", "high", "run-secret", calls[0], "redacted-prompt"):
+            self.assertNotIn(raw, serialized)
+        path = fleet.route_probe_receipt_path(root, route)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o444)
+        with self.assertRaises(fleet.MirroredLaunchError):
+            fleet.atomic_exclusive_json(path, receipt)
+
+        tampered = dict(receipt, model_sha256="0" * 64)
+        with self.assertRaisesRegex(fleet.MirroredLaunchError, "mismatched model_sha256"):
+            fleet.validate_route_probe_receipt(
+                tampered,
+                route=route,
+                run_id="run-secret",
+                snapshot_sha256="e" * 64,
+                command_sha256=receipt["command_sha256"],
+                executable_sha256=receipt["executable_sha256"],
+                sentinel_sha256=receipt["sentinel_sha256"],
+            )
+        malformed = dict(receipt, extra=True)
+        with self.assertRaisesRegex(fleet.MirroredLaunchError, "unexpected schema"):
+            fleet.validate_route_probe_receipt(
+                malformed,
+                route=route,
+                run_id="run-secret",
+                snapshot_sha256="e" * 64,
+                command_sha256=receipt["command_sha256"],
+                executable_sha256=receipt["executable_sha256"],
+                sentinel_sha256=receipt["sentinel_sha256"],
+            )
+
+    def test_route_probe_failure_classes_are_typed_and_never_retain_output(self) -> None:
+        route = {"provider": "claude", "model": "model", "effort": "medium"}
+        cwd = self.base / "probe-cwd"
+        cwd.mkdir()
+        output = self.base / "output"
+        cases = (
+            (subprocess.TimeoutExpired(["claude"], 1, output="sensitive"), "timeout"),
+            (OSError("sensitive spawn failure"), "spawn_failed"),
+            (subprocess.CompletedProcess(["claude"], 7, "sensitive", "sensitive"), "nonzero_exit"),
+            (
+                subprocess.CompletedProcess(
+                    ["claude"], 0, json.dumps({"is_error": True, "result": "sensitive"}), ""
+                ),
+                "provider_error",
+            ),
+            (subprocess.CompletedProcess(["claude"], 0, "not-json-sensitive", ""), "provider_output_invalid"),
+        )
+        for result, code in cases:
+            with self.subTest(code=code), mock.patch.object(
+                fleet.subprocess, "run", side_effect=result if isinstance(result, Exception) else None,
+                return_value=None if isinstance(result, Exception) else result,
+            ):
+                with self.assertRaises(fleet.RouteProbeError) as raised:
+                    fleet.execute_route_probe(
+                        route,
+                        cwd=cwd,
+                        output_path=output,
+                        sentinel="READY",
+                        timeout_seconds=1,
+                    )
+                self.assertEqual(raised.exception.code, code)
+                self.assertNotIn("sensitive", str(raised.exception))
+
+        with mock.patch.object(
+            fleet,
+            "execute_route_probe",
+            return_value=(["/absolute/claude", "-p", "prompt"], "WRONG", "2" * 64),
+        ):
+            with self.assertRaises(fleet.RouteProbeError) as raised:
+                fleet.run_route_probes(
+                    [route],
+                    root=self.base / "mismatch",
+                    run_id="run",
+                    snapshot_sha256="f" * 64,
+                    timeout_seconds=1,
+                )
+        self.assertEqual(raised.exception.code, "sentinel_mismatch")
+
+        transforms = (
+            lambda sentinel: " " + sentinel,
+            lambda sentinel: sentinel + " ",
+            lambda sentinel: sentinel + " extra",
+            lambda sentinel: sentinel + "\n\n",
+            lambda sentinel: sentinel + "\r",
+            lambda sentinel: sentinel + "\r\n\n",
+            lambda sentinel: sentinel + "\n\r\n",
+        )
+        for index, transform in enumerate(transforms):
+            with self.subTest(index=index), mock.patch.object(
+                fleet,
+                "execute_route_probe",
+                side_effect=lambda _route, **kwargs: (
+                    ["/absolute/claude", "-p", "prompt"],
+                    transform(kwargs["sentinel"]),
+                    "2" * 64,
+                ),
+            ):
+                with self.assertRaises(fleet.RouteProbeError) as raised:
+                    fleet.run_route_probes(
+                        [route],
+                        root=self.base / f"whitespace-{index}",
+                        run_id="run",
+                        snapshot_sha256="f" * 64,
+                        timeout_seconds=1,
+                    )
+            self.assertEqual(raised.exception.code, "sentinel_mismatch")
+
+        accepted_endings = ("", "\n", "\r\n")
+        for index, ending in enumerate(accepted_endings):
+            root = self.base / f"accepted-ending-{index}"
+            with self.subTest(ending=repr(ending)), mock.patch.object(
+                fleet,
+                "execute_route_probe",
+                side_effect=lambda _route, **kwargs: (
+                    ["/absolute/claude", "-p", "prompt"],
+                    kwargs["sentinel"] + ending,
+                    "2" * 64,
+                ),
+            ):
+                receipts = fleet.run_route_probes(
+                    [route],
+                    root=root,
+                    run_id="run",
+                    snapshot_sha256="f" * 64,
+                    timeout_seconds=1,
+                )
+            self.assertEqual(len(receipts), 1)
+
+    def test_route_probe_timeout_and_nonzero_remove_codex_output_residue(self) -> None:
+        route = {"provider": "codex", "model": "model", "effort": "low"}
+
+        def result_with_residue(kind):
+            def side_effect(argv, **_kwargs):
+                output = Path(argv[argv.index("--output-last-message") + 1])
+                output.write_text("sensitive partial provider output", encoding="utf-8")
+                if kind == "timeout":
+                    raise subprocess.TimeoutExpired(argv, 1, output="sensitive")
+                return subprocess.CompletedProcess(argv, 9, "sensitive", "sensitive")
+
+            return side_effect
+
+        for kind, code in (("timeout", "timeout"), ("nonzero", "nonzero_exit")):
+            root = self.base / f"cleanup-{kind}"
+            output = root / "transient" / fleet.route_probe_identity(route)
+            with self.subTest(kind=kind), mock.patch.object(
+                fleet.subprocess, "run", side_effect=result_with_residue(kind)
+            ):
+                with self.assertRaises(fleet.RouteProbeError) as raised:
+                    fleet.run_route_probes(
+                        [route],
+                        root=root,
+                        run_id="run",
+                        snapshot_sha256="f" * 64,
+                        timeout_seconds=1,
+                    )
+            self.assertEqual(raised.exception.code, code)
+            self.assertFalse(output.exists())
+
+    def test_route_probe_fails_when_provider_binary_cannot_be_resolved(self) -> None:
+        route = {"provider": "codex", "model": "model", "effort": "low"}
+        with mock.patch.object(fleet.shutil, "which", return_value=None):
+            with self.assertRaises(fleet.RouteProbeError) as raised:
+                fleet.route_probe_command(
+                    route,
+                    cwd=self.base,
+                    codex_output=self.base / "output",
+                    sentinel="READY",
+                )
+        self.assertEqual(raised.exception.code, "provider_binary_missing")
+
+    def test_route_probe_detects_provider_binary_change_during_execution(self) -> None:
+        route = {"provider": "codex", "model": "model", "effort": "low"}
+        executable = self.base / "fake-codex"
+        executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+
+        def mutate_binary(argv, **_kwargs):
+            executable.write_bytes(b"#!/bin/sh\nexit 1\n")
+            executable.chmod(0o755)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with (
+            mock.patch.object(fleet, "provider_binary_path", return_value=executable),
+            mock.patch.object(fleet.subprocess, "run", side_effect=mutate_binary),
+        ):
+            with self.assertRaises(fleet.RouteProbeError) as raised:
+                fleet.execute_route_probe(
+                    route,
+                    cwd=self.base,
+                    output_path=self.base / "output",
+                    sentinel="READY",
+                    timeout_seconds=1,
+                )
+        self.assertEqual(raised.exception.code, "provider_binary_changed")
+
     def test_mirrored_requires_nonempty_task(self) -> None:
         for task_args in ((), ("--task", "")):
             with self.subTest(task_args=task_args):
@@ -617,6 +920,84 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
         self.assertEqual(failure["rollback"]["closed"], ["workspace:101"])
         self.assertTrue(failure["sealed_results_invalidation"]["completed"])
         self.assertNotIn("TOKEN", json.dumps(failure))
+
+    def test_route_probe_failure_invalidates_pre_release_and_creates_zero_workspaces(self) -> None:
+        inputs = self._launch_inputs()
+        route = {"provider": "codex", "model": "model", "effort": "high"}
+        inputs.update(
+            route_probes=[route],
+            route_probe_root=self.base / "probe-root",
+            route_probe_timeout_seconds=2,
+        )
+        route_sha256 = fleet.route_probe_identity(route)
+        with (
+            mock.patch.object(
+                fleet,
+                "run_route_probes",
+                side_effect=fleet.RouteProbeError("sentinel_mismatch", route_sha256),
+            ) as probes,
+            mock.patch.object(fleet, "create_workspace") as create,
+        ):
+            with self.assertRaises(fleet.MirroredLaunchError):
+                fleet.launch_mirrored_workspaces(**inputs)
+
+        probes.assert_called_once()
+        create.assert_not_called()
+        self.assertFalse(inputs["gate_path"].exists())
+        failure = json.loads(inputs["receipt_path"].read_text(encoding="utf-8"))
+        self.assertFalse(failure["valid"])
+        self.assertEqual(failure["status"], "launch_failed")
+        self.assertEqual(failure["created_workspaces"], [])
+        self.assertEqual(
+            failure["failure"],
+            {
+                "phase": "provider_route_readiness",
+                "code": "sentinel_mismatch",
+                "route_sha256": route_sha256,
+            },
+        )
+        self.assertTrue(failure["sealed_results_invalidation"]["completed"])
+        self.assertEqual(
+            fleet.sealed_results.invalidation_status(inputs["seal_root"])["reason_code"],
+            "pre_release_failure",
+        )
+
+    def test_successful_route_probes_finish_before_first_workspace_creation(self) -> None:
+        inputs = self._launch_inputs()
+        route = {"provider": "codex", "model": "model", "effort": "high"}
+        inputs.update(
+            route_probes=[route],
+            route_probe_root=self.base / "probe-root",
+            route_probe_timeout_seconds=2,
+        )
+        events: list[str] = []
+        refs = iter(f"workspace:{number}" for number in range(101, 105))
+        probe_receipt = {"route_sha256": fleet.route_probe_identity(route)}
+
+        with (
+            mock.patch.object(
+                fleet,
+                "run_route_probes",
+                side_effect=lambda *_args, **_kwargs: (events.append("probe"), [probe_receipt])[1],
+            ),
+            mock.patch.object(
+                fleet,
+                "create_workspace",
+                side_effect=lambda *_args, **_kwargs: (
+                    events.append("create"),
+                    {"workspace_ref": next(refs)},
+                )[1],
+            ),
+            mock.patch.object(fleet, "read_cmux_topology", return_value=self._mock_topology()),
+            mock.patch.object(fleet, "wait_for_child_readiness", return_value=[]),
+        ):
+            receipt = fleet.launch_mirrored_workspaces(**inputs)
+
+        self.assertEqual(events[0], "probe")
+        self.assertEqual(events.count("create"), 4)
+        self.assertTrue(receipt["provider_route_readiness"]["verified"])
+        self.assertEqual(receipt["provider_route_readiness"]["expected"], 1)
+        self.assertEqual(receipt["provider_route_readiness"]["receipts"], [probe_receipt])
 
     def test_topology_failure_rolls_back_only_four_invocation_owned_refs(self) -> None:
         inputs = self._launch_inputs()

@@ -51,6 +51,39 @@ READINESS_BOUNDARY = (
     "against a malicious same-user process."
 )
 READINESS_SCHEMA_VERSION = 1
+ROUTE_PROBE_SCHEMA_VERSION = 1
+ROUTE_PROBE_RECEIPT_KEYS = {
+    "schema_version",
+    "ready",
+    "run_id_sha256",
+    "route_sha256",
+    "provider_sha256",
+    "model_sha256",
+    "effort_sha256",
+    "target_snapshot_sha256",
+    "command_sha256",
+    "executable_sha256",
+    "sentinel_sha256",
+    "completed_at_utc",
+}
+PROBE_ENV_DENYLIST = {
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_BASE_URL",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_ENDPOINT",
+}
 READINESS_KEYS = {
     "schema_version",
     "ready",
@@ -376,6 +409,281 @@ def create_workspace(name: str, repo: Path, layout: dict) -> dict:
 
 class MirroredLaunchError(RuntimeError):
     """A mirrored fleet failed topology or post-release readiness validation."""
+
+
+class RouteProbeError(MirroredLaunchError):
+    """A subscription-backed route probe failed without retaining provider output."""
+
+    def __init__(self, code: str, route_sha256: str):
+        self.code = code
+        self.route_sha256 = route_sha256
+        super().__init__(f"provider route readiness failed ({code}) for {route_sha256}")
+
+
+def provider_routes(args: argparse.Namespace) -> list[dict[str, str]]:
+    """Return each distinct provider/model/effort route used by a mirrored fleet."""
+
+    candidates = (
+        ("codex", args.codex_lead_model, "medium"),
+        ("codex", args.codex_worker_model, "low"),
+        ("claude", args.claude_worker_model, "medium"),
+        ("codex", args.codex_orchestrator_model, "high"),
+        ("claude", args.claude_orchestrator_model, "high"),
+    )
+    return [
+        {"provider": provider, "model": model, "effort": effort}
+        for provider, model, effort in dict.fromkeys(candidates)
+    ]
+
+
+def route_probe_identity(route: dict[str, str]) -> str:
+    if set(route) != {"provider", "model", "effort"}:
+        raise MirroredLaunchError("provider route has an unexpected schema")
+    if route["provider"] not in {"codex", "claude"}:
+        raise MirroredLaunchError("provider route names an unsupported provider")
+    if not all(isinstance(route[key], str) and route[key] for key in route):
+        raise MirroredLaunchError("provider route fields must be non-empty strings")
+    return sha256(sealed_results.canonical_json(route))
+
+
+def route_probe_receipt_path(root: Path, route: dict[str, str]) -> Path:
+    return Path(root) / "receipts" / f"{route_probe_identity(route)}.json"
+
+
+def provider_binary_path(route: dict[str, str]) -> Path:
+    value = shutil.which(route["provider"])
+    if not value:
+        raise RouteProbeError("provider_binary_missing", route_probe_identity(route))
+    try:
+        path = Path(value).resolve(strict=True)
+        if not path.is_file() or not os.access(path, os.R_OK | os.X_OK):
+            raise OSError("provider binary is not readable and executable")
+        path.read_bytes()
+    except OSError as exc:
+        raise RouteProbeError("provider_binary_unreadable", route_probe_identity(route)) from exc
+    return path
+
+
+def route_probe_command(
+    route: dict[str, str],
+    *,
+    cwd: Path,
+    codex_output: Path,
+    sentinel: str,
+) -> list[str]:
+    """Build a non-persistent, read-only/disabled-tools subscription CLI turn."""
+
+    provider = route["provider"]
+    provider_binary = str(provider_binary_path(route))
+    prompt = f"Reply with exactly this single line and nothing else:\n{sentinel}"
+    if provider == "codex":
+        return [
+            provider_binary,
+            "exec",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "-C",
+            str(cwd),
+            "--model",
+            route["model"],
+            "-c",
+            f'model_reasoning_effort="{route["effort"]}"',
+            "--sandbox",
+            "read-only",
+            "--output-last-message",
+            str(codex_output),
+            prompt,
+        ]
+    if provider == "claude":
+        return [
+            provider_binary,
+            "-p",
+            "--model",
+            route["model"],
+            "--effort",
+            route["effort"],
+            "--output-format",
+            "json",
+            "--tools",
+            "",
+            "--permission-mode",
+            "plan",
+            "--no-session-persistence",
+            "--safe-mode",
+            prompt,
+        ]
+    raise MirroredLaunchError("provider route names an unsupported provider")
+
+
+def validate_route_probe_receipt(
+    payload: Any,
+    *,
+    route: dict[str, str],
+    run_id: str,
+    snapshot_sha256: str,
+    command_sha256: str,
+    executable_sha256: str,
+    sentinel_sha256: str,
+) -> None:
+    if not isinstance(payload, dict) or set(payload) != ROUTE_PROBE_RECEIPT_KEYS:
+        raise MirroredLaunchError("provider route receipt has an unexpected schema")
+    expected = {
+        "schema_version": ROUTE_PROBE_SCHEMA_VERSION,
+        "ready": True,
+        "run_id_sha256": sha256(run_id),
+        "route_sha256": route_probe_identity(route),
+        "provider_sha256": sha256(route["provider"]),
+        "model_sha256": sha256(route["model"]),
+        "effort_sha256": sha256(route["effort"]),
+        "target_snapshot_sha256": snapshot_sha256,
+        "command_sha256": command_sha256,
+        "executable_sha256": executable_sha256,
+        "sentinel_sha256": sentinel_sha256,
+    }
+    for key, value in expected.items():
+        if payload.get(key) != value:
+            raise MirroredLaunchError(f"provider route receipt has mismatched {key}")
+    completed_at = payload.get("completed_at_utc")
+    if not isinstance(completed_at, str):
+        raise MirroredLaunchError("provider route receipt has no UTC timestamp")
+    sealed_results.parse_utc_timestamp(completed_at)
+
+
+def execute_route_probe(
+    route: dict[str, str],
+    *,
+    cwd: Path,
+    output_path: Path,
+    sentinel: str,
+    timeout_seconds: int,
+) -> tuple[list[str], str, str]:
+    """Execute one probe and return its argv plus the exact assistant response."""
+
+    argv = route_probe_command(route, cwd=cwd, codex_output=output_path, sentinel=sentinel)
+    try:
+        executable_sha256 = sha256(Path(argv[0]).read_bytes())
+    except OSError as exc:
+        raise RouteProbeError("provider_binary_unreadable", route_probe_identity(route)) from exc
+    environment = os.environ.copy()
+    for name in PROBE_ENV_DENYLIST:
+        environment.pop(name, None)
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=cwd,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RouteProbeError("timeout", route_probe_identity(route)) from exc
+    except OSError as exc:
+        raise RouteProbeError("spawn_failed", route_probe_identity(route)) from exc
+    try:
+        if sha256(Path(argv[0]).read_bytes()) != executable_sha256:
+            raise RouteProbeError("provider_binary_changed", route_probe_identity(route))
+    except OSError as exc:
+        raise RouteProbeError("provider_binary_unreadable", route_probe_identity(route)) from exc
+    if result.returncode != 0:
+        raise RouteProbeError("nonzero_exit", route_probe_identity(route))
+    if route["provider"] == "codex":
+        try:
+            response = output_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise RouteProbeError("provider_output_invalid", route_probe_identity(route)) from exc
+    else:
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RouteProbeError("provider_output_invalid", route_probe_identity(route)) from exc
+        if not isinstance(payload, dict) or payload.get("is_error") is not False:
+            raise RouteProbeError("provider_error", route_probe_identity(route))
+        response = payload.get("result")
+        if not isinstance(response, str):
+            raise RouteProbeError("provider_output_invalid", route_probe_identity(route))
+    return argv, response, executable_sha256
+
+
+def run_route_probes(
+    routes: list[dict[str, str]],
+    *,
+    root: Path,
+    run_id: str,
+    snapshot_sha256: str,
+    timeout_seconds: int,
+) -> list[dict[str, Any]]:
+    """Prove every distinct subscription route before CMUX creates any workspace."""
+
+    if root.exists():
+        raise MirroredLaunchError(f"refusing to reuse provider route readiness state: {root}")
+    root.mkdir(mode=0o700, parents=True)
+    receipts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for route in routes:
+        route_sha256 = route_probe_identity(route)
+        if route_sha256 in seen:
+            continue
+        seen.add(route_sha256)
+        cwd = root / "cwd" / route_sha256
+        cwd.mkdir(mode=0o700, parents=True)
+        output_path = root / "transient" / route_sha256
+        output_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        sentinel = f"CMUX-ROUTE-READY:{sha256(run_id)[:16]}:{route_sha256[:24]}"
+        try:
+            argv, response, executable_sha256 = execute_route_probe(
+                route,
+                cwd=cwd,
+                output_path=output_path,
+                sentinel=sentinel,
+                timeout_seconds=timeout_seconds,
+            )
+            if response not in {sentinel, sentinel + "\n", sentinel + "\r\n"}:
+                raise RouteProbeError("sentinel_mismatch", route_sha256)
+            command_sha256 = sha256(sealed_results.canonical_json(argv))
+            receipt: dict[str, Any] = {
+                "schema_version": ROUTE_PROBE_SCHEMA_VERSION,
+                "ready": True,
+                "run_id_sha256": sha256(run_id),
+                "route_sha256": route_sha256,
+                "provider_sha256": sha256(route["provider"]),
+                "model_sha256": sha256(route["model"]),
+                "effort_sha256": sha256(route["effort"]),
+                "target_snapshot_sha256": snapshot_sha256,
+                "command_sha256": command_sha256,
+                "executable_sha256": executable_sha256,
+                "sentinel_sha256": sha256(sentinel),
+                "completed_at_utc": sealed_results.utc_timestamp(datetime.now(timezone.utc)),
+            }
+            validate_route_probe_receipt(
+                receipt,
+                route=route,
+                run_id=run_id,
+                snapshot_sha256=snapshot_sha256,
+                command_sha256=command_sha256,
+                executable_sha256=executable_sha256,
+                sentinel_sha256=sha256(sentinel),
+            )
+            path = route_probe_receipt_path(root, route)
+            atomic_exclusive_json(path, receipt)
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            validate_route_probe_receipt(
+                persisted,
+                route=route,
+                run_id=run_id,
+                snapshot_sha256=snapshot_sha256,
+                command_sha256=command_sha256,
+                executable_sha256=executable_sha256,
+                sentinel_sha256=sha256(sentinel),
+            )
+            receipts.append(persisted)
+        finally:
+            output_path.unlink(missing_ok=True)
+        if any(cwd.iterdir()):
+            raise MirroredLaunchError("provider route probe cwd is not empty")
+    return sorted(receipts, key=lambda item: item["route_sha256"])
 
 
 def command_provider(value: str) -> str:
@@ -1014,8 +1322,11 @@ def launch_mirrored_workspaces(
     readiness_timeout_seconds: int,
     readiness_liveness_seconds: float = 0.75,
     readiness_settle_seconds: float = 1.0,
+    route_probes: list[dict[str, str]] | None = None,
+    route_probe_root: Path | None = None,
+    route_probe_timeout_seconds: int = 30,
 ) -> dict:
-    """Create, release, then validate every authenticated live child."""
+    """Probe routes, then create, release, and validate every live child."""
 
     specs: list[dict[str, object]] = []
     for kind in ("codex", "claude"):
@@ -1042,12 +1353,23 @@ def launch_mirrored_workspaces(
     created: list[dict[str, object]] = []
     expected_children: list[dict[str, str]] = []
     readiness_receipts: list[dict[str, Any]] = []
+    route_probe_receipts: list[dict[str, Any]] = []
     barrier_released = False
     try:
         if gate_path.exists():
             raise MirroredLaunchError(f"refusing to reuse an already released barrier: {gate_path}")
         if readiness_root.exists():
             raise MirroredLaunchError(f"refusing to reuse child-readiness state: {readiness_root}")
+        if route_probes:
+            if route_probe_root is None:
+                raise MirroredLaunchError("provider route readiness root is required")
+            route_probe_receipts = run_route_probes(
+                route_probes,
+                root=route_probe_root,
+                run_id=run_id,
+                snapshot_sha256=snapshot_sha256,
+                timeout_seconds=route_probe_timeout_seconds,
+            )
         for spec in specs:
             try:
                 response = create_workspace(
@@ -1147,12 +1469,24 @@ def launch_mirrored_workspaces(
                 "verified": False,
                 "expected": len(expected_children),
             },
+            "provider_route_readiness": {
+                "root": str(route_probe_root) if route_probe_root else None,
+                "verified": False,
+                "expected": len({route_probe_identity(route) for route in route_probes or []}),
+                "completed": len(route_probe_receipts),
+            },
             "created_workspaces": [
                 {key: item[key] for key in ("role", "name", "ref")} for item in created
             ],
             "rollback": rollback,
             "error": str(exc),
         }
+        if isinstance(exc, RouteProbeError):
+            failure["failure"] = {
+                "phase": "provider_route_readiness",
+                "code": exc.code,
+                "route_sha256": exc.route_sha256,
+            }
         write_receipt(receipt_path, failure)
         raise MirroredLaunchError(str(exc)) from exc
 
@@ -1169,6 +1503,13 @@ def launch_mirrored_workspaces(
             "expected": len(expected_children),
             "receipts": readiness_receipts,
             "security_boundary": READINESS_BOUNDARY,
+        },
+        "provider_route_readiness": {
+            "root": str(route_probe_root) if route_probe_root else None,
+            "verified": bool(route_probes),
+            "timeout_seconds": route_probe_timeout_seconds,
+            "expected": len({route_probe_identity(route) for route in route_probes or []}),
+            "receipts": route_probe_receipts,
         },
         "topology": {
             "verified": True,
@@ -1225,6 +1566,12 @@ def parser() -> argparse.ArgumentParser:
         type=positive_duration,
         default=1.0,
         help="post-receipt early-exit settle window (default: 1.0)",
+    )
+    p.add_argument(
+        "--route-probe-timeout-seconds",
+        type=positive_seconds,
+        default=60,
+        help="bounded wait for each subscription-backed provider route turn (default: 60)",
     )
     p.add_argument("--codex-orchestrator-model", default="gpt-5.6-sol")
     p.add_argument("--claude-orchestrator-model", default="claude-opus-4-8")
@@ -1406,8 +1753,10 @@ def main() -> None:
         seal_root = ROOT / ".team" / "sealed-results" / project / run_id
         gate_path = ROOT / ".team" / "launch-gates" / project / run_id / "released.json"
         readiness_root = ROOT / ".team" / "child-readiness" / project / run_id
+        route_probe_root = ROOT / ".team" / "route-probes" / project / run_id
         receipt_path = ROOT / ".team" / f"{project}.{run_id}.subscription-spawn.json"
         teams = ("codex", "claude")
+        routes = provider_routes(args)
         if args.dry_run:
             capabilities = {kind: f"<REDACTED-{kind.upper()}-CAPABILITY>" for kind in teams}
             capability_paths = {
@@ -1504,6 +1853,12 @@ def main() -> None:
                 "verified": False,
                 "security_boundary": READINESS_BOUNDARY,
             },
+            "provider_route_readiness": {
+                "root": str(route_probe_root),
+                "timeout_seconds": args.route_probe_timeout_seconds,
+                "verified": False,
+                "planned_routes": routes,
+            },
             "envelope": envelope,
             "team_workspaces": envelope["teams"],
             "orchestrators": {
@@ -1541,6 +1896,7 @@ def main() -> None:
             "timeout_minutes": args.timeout_minutes,
             "readiness_timeout_seconds": args.readiness_timeout_seconds,
             "readiness_settle_seconds": args.readiness_settle_seconds,
+            "route_probe_timeout_seconds": args.route_probe_timeout_seconds,
             "surface_read_only_boundary": SURFACE_READ_ONLY_BOUNDARY,
         }
         try:
@@ -1559,6 +1915,9 @@ def main() -> None:
                 snapshot_sha256=str(snapshot["snapshot_sha256"]),
                 readiness_timeout_seconds=args.readiness_timeout_seconds,
                 readiness_settle_seconds=args.readiness_settle_seconds,
+                route_probes=routes,
+                route_probe_root=route_probe_root,
+                route_probe_timeout_seconds=args.route_probe_timeout_seconds,
             )
         except MirroredLaunchError as exc:
             die(f"mirrored fleet launch failed closed: {exc}")
