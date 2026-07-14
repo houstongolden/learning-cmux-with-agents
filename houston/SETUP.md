@@ -150,14 +150,16 @@ python3 scripts/spawn_subscription_fleet.py \
   --mirrored \
   --task-file /absolute/path/to/task.md \
   --timeout-minutes 20 \
+  --route-probe-timeout-seconds 60 \
   --readiness-timeout-seconds 30 \
   --readiness-settle-seconds 1.0
 ```
 
-All three timing flags are optional. `--timeout-minutes` defaults to `20` and
-sets the result deadline; `--readiness-timeout-seconds` defaults to `30` for
-collecting every child receipt; `--readiness-settle-seconds` defaults to `1.0`
-for detecting immediate post-receipt exits.
+All four timing flags are optional. `--timeout-minutes` defaults to `20` and
+sets the result deadline; `--route-probe-timeout-seconds` defaults to `60` per
+unique provider/model/effort route; `--readiness-timeout-seconds` defaults to
+`30` for collecting every child receipt; `--readiness-settle-seconds` defaults
+to `1.0` for detecting immediate post-receipt exits.
 
 The envelope binds the task to repository HEAD, the tracked staged+unstaged
 binary diff, and an ordered untracked path/type/mode/content-or-symlink-target
@@ -212,7 +214,24 @@ after the deadline are rejected. After expiration, `status` is ready and
 `reveal` returns the real result beside a typed `infrastructure_failure`; that is
 an adjudication record, not a model loss.
 
-### Four-workspace topology barrier
+### Provider-route and four-workspace readiness barriers
+
+Before creating CMUX workspaces, the launcher completes one minimal model turn
+for each unique provider/model/effort route. These one-shot probes use the
+existing `codex login` and Claude subscription sessions. The launcher removes
+provider API-key, alternate-base-URL, Bedrock/Vertex/Foundry, and related cloud
+credential/routing variables while preserving subscription OAuth and keychain
+state. Probes run in fresh empty directories with read-only or disabled-tool
+configuration and no session persistence. Provider CLIs are resolved to
+absolute paths, and their executable content digests are checked after the
+turn. The response must be the bare run-bound sentinel, sentinel plus one LF,
+or sentinel plus one CRLF. Probe output is deleted. The immutable receipt contains only hashes
+binding the run, route, repository snapshot, command, executable content, and
+sentinel plus a UTC completion time. Reused routes are deduplicated.
+
+A timeout, nonzero exit, provider error, malformed output, or sentinel mismatch
+fails closed. The coordinator invalidates the sealed contract before release
+and creates zero CMUX workspaces.
 
 The mirrored launcher now places both team workspaces and both orchestrator
 workspaces behind one shared filesystem gate. No agent command starts until
@@ -223,9 +242,11 @@ Every released surface then authenticates through its subscription CLI, starts
 under a supervisor, survives a short liveness check, and writes an immutable
 receipt bound to run, team, role, workspace ref, surface ref, and repository
 snapshot. The launcher requires all receipts within the readiness timeout and
-then rejects exit markers during the settle window. This is not completed-turn
-readiness: an authenticated, live CLI may still be blocked by quota or fail its
-first model turn.
+then rejects exit markers during the settle window. The earlier route probes
+prove a completed turn and quota availability for each unique route at launch;
+this surface phase proves that each interactive process authenticated and
+started. It does not prove a completed turn for every interactive surface or
+continued quota availability after launch.
 
 Every run-owned surface process tree is wrapped in macOS Seatbelt and denied
 target-repository writes. Raw CMUX surfaces and separately launched same-user
@@ -237,9 +258,11 @@ Supervisors monitor invalidation and TERM/KILL their complete process groups.
 The invalid receipt records every failed close; invalidated contracts cannot
 submit, expire, or reveal a raced late result.
 
-Remediation tests currently pass `28/28` across sealing, invalidation races,
-trust, Seatbelt enforcement, topology, bound readiness, early-exit settlement,
-process-group termination, no-replace gate release, and scoped rollback.
+Remediation tests currently pass `37/37` across sealing, route-turn probes,
+hash-only receipts, pre-release invalidation with zero workspaces, invalidation
+races, trust, Seatbelt enforcement, topology, bound surface readiness,
+early-exit settlement, process-group termination, no-replace gate release, and
+scoped rollback.
 
 The exact envelope, submission, and scoring contracts are in
 [MIRRORED-AB-PROTOCOL.md](MIRRORED-AB-PROTOCOL.md).
@@ -262,7 +285,6 @@ are specified in [ENDPOINTS.md](ENDPOINTS.md).
 
 ## Remaining acceptance blockers
 
-- provider completed-turn readiness, including quota availability;
 - a run-scoped CMUX broker or stronger hostile-model isolation;
 - one fresh clean mirrored rerun after the Claude subscription reset.
 

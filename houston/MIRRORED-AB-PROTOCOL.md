@@ -103,12 +103,36 @@ Every run-owned surface command is wrapped in a macOS Seatbelt profile that
 denies target-repository writes for its complete process tree. Raw CMUX surfaces
 and separately launched same-user processes are outside this boundary.
 
+Before CMUX creates any workspace, the launcher completes one subscription-
+authenticated model turn for every unique provider/model/effort route. Each
+probe runs in a fresh empty directory with safe read-only or disabled-tool
+configuration and no persistence. Provider API-key, alternate-base-URL,
+Bedrock/Vertex/Foundry, and related cloud credential/routing variables are
+removed while subscription OAuth and keychain state are preserved, retaining
+the existing `codex login` and Claude subscription paths. Each provider CLI is
+resolved to an absolute executable path and its content digest is verified
+after the turn. The provider has
+`--route-probe-timeout-seconds 60` per route to return the bare run-bound
+sentinel, sentinel plus one LF, or sentinel plus one CRLF. Raw output is
+deleted; the exclusive immutable receipt stores only hashes binding the run, route,
+repository snapshot, command, executable content, and sentinel plus the UTC
+completion time. Identical routes are probed once.
+
+Any route timeout, nonzero exit, provider error, invalid output, or sentinel
+mismatch invalidates the sealed-results contract before release and leaves zero
+CMUX workspaces. Only after every route receipt validates can topology creation
+begin.
+
 After the no-replace topology gate releases, supervisors perform provider-auth
-preflight and short liveness checks. Each immutable readiness receipt binds the
-run, team, role, workspace ref, surface ref, and target snapshot. All receipts
-must arrive within `--readiness-timeout-seconds 30`, then survive the
-`--readiness-settle-seconds 1.0` early-exit window. This does not prove a
-completed model turn or available provider quota.
+preflight and short liveness checks for every interactive surface. Each second-
+phase immutable readiness receipt binds the run, team, role, workspace ref,
+surface ref, and target snapshot. All receipts must arrive within
+`--readiness-timeout-seconds 30`, then survive the
+`--readiness-settle-seconds 1.0` early-exit window. The combined contract proves
+a completed turn and available quota for every unique route at launch time and
+initial authentication/liveness for every surface. It does not prove a
+completed turn for each interactive session or quota availability later in the
+run.
 
 ## 4. Seal results before reveal
 

@@ -125,23 +125,45 @@ cmux topologyâ€”run-owned refs, expected titles, and expected terminal surfacesâ
 before publishing the gate with atomic no-replace semantics. Gate collisions
 fail closed instead of replacing another run's release record.
 
-After release, one supervisor per expected surface performs provider-auth
-preflight, starts the provider in a dedicated process group, verifies short
-liveness, and publishes an immutable receipt bound to run, team, role,
-workspace ref, surface ref, and repository snapshot. The launcher waits up to
-`--readiness-timeout-seconds` (default `30`) for every receipt, then watches a
-`--readiness-settle-seconds` window (default `1.0`) for immediate exit markers.
-This proves provider authentication, short process liveness, and survival of
-that early-exit window. It does **not** prove a completed model turn, usable
-provider quota, or successful reasoning.
+Readiness has two fail-closed phases. Before CMUX creates any workspace, the
+launcher runs one subscription-authenticated, completed model turn for every
+unique provider/model/effort route in the planned fleet. Codex probes use an
+ephemeral, ignored-user-config/rules, read-only invocation; Claude probes use
+plan mode, no tools, safe mode, and no session persistence. Provider API-key,
+alternate-base-URL, Bedrock/Vertex/Foundry, and related cloud credential/routing
+variables are removed from each probe environment while subscription OAuth and
+keychain state are preserved. The probes therefore exercise the existing
+`codex login` and Claude subscription sessions. Each provider CLI is resolved
+to its absolute executable path before launch; its content digest is verified
+after the turn and bound into the receipt. Each route has
+`--route-probe-timeout-seconds` (default `60`) to return its exact run-bound
+sentinel as bare text, sentinel plus one LF, or sentinel plus one CRLF. The
+response is deleted; an immutable receipt retains only hashes of the run, route fields, repository snapshot,
+command, executable content, and sentinel plus its UTC completion time.
+Duplicate routes are probed once.
 
-On any launch or readiness failure, the coordinator atomically invalidates the
-sealed-results contract before rollback. Invalidated runs cannot submit,
+Only after every route receipt validates does CMUX creation begin. After the
+topology gate releases, one supervisor per expected surface performs
+provider-auth preflight, starts the provider in a dedicated process group,
+verifies short liveness, and publishes a second immutable receipt bound to run,
+team, role, workspace ref, surface ref, and repository snapshot. The launcher
+waits up to `--readiness-timeout-seconds` (default `30`) for every surface
+receipt, then watches a `--readiness-settle-seconds` window (default `1.0`) for
+immediate exit markers. Together these phases prove a completed turn and quota
+availability for each unique planned route at launch time, plus authentication
+and initial liveness for each interactive surface. They do **not** prove that
+every interactive surface completes its own turn or that quota remains
+available later in the run.
+
+On any route-probe, launch, or surface-readiness failure, the coordinator
+atomically invalidates the sealed-results contract before rollback. Route-probe
+failure occurs before CMUX creation and therefore leaves zero workspaces.
+Invalidated runs cannot submit,
 expire, or reveal results, even if a late writer races publication. Supervisors
 observe invalidation and send TERM, then KILL if necessary, to their entire
 provider process group. Run-owned workspaces are closed in reverse order;
 failed closes remain explicit in the invalid receipt. The focused suite is
-currently `28/28` passing.
+currently `37/37` passing.
 
 ### Deadline adjudication
 

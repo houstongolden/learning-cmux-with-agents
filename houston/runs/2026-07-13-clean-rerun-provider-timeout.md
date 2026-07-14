@@ -103,24 +103,38 @@ checkpoint.
 
 ## Launch hardening added after this run
 
-Subsequent commits `e2e2496` and `ec6f48e` add fail-closed launch supervision;
-they do not alter this historical run or reveal its Codex result. Every
-run-owned surface process tree is now Seatbelt-denied target writes, while raw
+Subsequent hardening adds provider-route turn probes and fail-closed launch
+supervision; it does not alter this historical run or reveal its Codex result.
+Before any new CMUX workspace is created, the launcher now completes one
+subscription-authenticated turn per unique provider/model/effort route, with a
+60-second per-route default. Probe environments scrub provider API-key,
+alternate-base-URL, Bedrock/Vertex/Foundry, and related cloud
+credential/routing variables while preserving subscription OAuth and keychain
+state. They use fresh empty directories and safe read-only/disabled-tool
+configuration. Provider CLIs resolve to absolute paths and their executable
+content digests are verified after the turn. The response may be only the bare
+run-bound sentinel, sentinel plus one LF, or sentinel plus one CRLF. Output is
+deleted and only immutable hash-bound receipts remain. A failed probe invalidates the seal pre-release and leaves zero
+workspaces.
+
+Every run-owned surface process tree is now Seatbelt-denied target writes, while raw
 CMUX and separately launched same-user processes remain outside the boundary.
 The topology gate uses atomic no-replace publication.
 
-Supervisors perform provider-auth preflight, short liveness validation, and a
-one-second early-exit settle. Their immutable receipts bind run, team, role,
-workspace, surface, and snapshot. This still does not prove a completed model
-turn or provider quota availability. Failed launch/readiness atomically
-invalidates the sealed contract before rollback; supervisors then TERM/KILL the
-full process group, and receipts retain any workspace-close failures.
+After route readiness passes and topology releases, supervisors perform
+provider-auth preflight, short liveness validation, and a one-second early-exit
+settle for every interactive surface. Their immutable receipts bind run, team,
+role, workspace, surface, and snapshot. Route probes prove a completed turn and
+quota availability for each unique route at launch; surface receipts prove
+initial authentication and liveness, not a completed turn for each session or
+continued quota. Failed launch/readiness atomically invalidates the sealed
+contract before rollback; supervisors then TERM/KILL the full process group,
+and receipts retain any workspace-close failures.
 Capabilities now use per-team mode-`0400` token files instead of argv values.
-The combined focused suite is `28/28` passing.
+The combined focused suite is `37/37` passing.
 
 ## Remaining blockers
 
-- provider completed-turn readiness, including quota availability;
 - a run-scoped CMUX broker or stronger hostile-model isolation;
 - a fresh clean mirrored rerun after the Claude subscription reset.
 
