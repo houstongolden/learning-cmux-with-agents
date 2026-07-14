@@ -18,6 +18,8 @@ shape is:
   "immutable": true,
   "run_id": "20260713T000000Z-<task-hash-prefix>",
   "created_at_utc": "ISO-8601",
+  "deadline_utc": "ISO-8601 UTC",
+  "timeout_minutes": 20,
   "mode": "compare",
   "project": "bigbounce-p3-review",
   "repo": "/absolute/path/to/repo",
@@ -41,7 +43,8 @@ shape is:
     "root": "/absolute/path/to/.team/sealed-results/<project>/<run-id>",
     "security_boundary": "<procedural isolation warning>",
     "contract_sha256": "<sha256>",
-    "capability_sha256": {"codex": "<sha256>", "claude": "<sha256>"}
+    "capability_sha256": {"codex": "<sha256>", "claude": "<sha256>"},
+    "deadline_utc": "ISO-8601 UTC"
   },
   "comparison_rules": {
     "target_repo_read_only": true,
@@ -126,8 +129,21 @@ python3 scripts/sealed_results.py reveal --root "$SEALED_ROOT"
 ```
 
 Before that point, summaries, progress comparisons, and scores remain withheld.
-A timeout is a scored outcome, not permission to show the completed arm to the
-still-running arm.
+For new contracts, `--timeout-minutes` defaults to `20`. At or after the stored
+deadline, expire one missing arm with a typed infrastructure result:
+
+```bash
+python3 scripts/sealed_results.py expire \
+  --root "$SEALED_ROOT" \
+  --team claude \
+  --reason-code provider_subscription_limit \
+  --message "Provider limit prevented completion before deadline"
+```
+
+Expiration is impossible before the deadline, on a contract without a deadline,
+or over an existing submission. A model cannot submit at or after its deadline.
+The expiration marker completes the pair so the coordinator can reveal both
+records together; it is infrastructure evidence, not a model-quality loss.
 
 Required payload fields: final answer or patch reference; evidence and source
 provenance; commands and results; elapsed time; actual model route; worker

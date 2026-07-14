@@ -123,9 +123,19 @@ persists an invalid receipt with rollback evidence.
 This barrier proves topology readiness, not child readiness. A released gate
 does not show that each Codex/Claude process has completed onboarding,
 authenticated, or begun reasoning. Post-release child health, controller
-read-only enforcement, paired deadline/timeout adjudication, and a fresh clean
-mirrored rerun remain open acceptance work. The focused remediation suite is
-currently `15/15` passing.
+read-only enforcement, and a fresh clean post-reset mirrored rerun remain open
+acceptance work. The focused remediation suite is currently `19/19` passing.
+
+### Deadline adjudication
+
+New mirrored contracts store a UTC deadline derived from `--timeout-minutes`
+(default `20`). A normal model submission is accepted only before that deadline.
+Afterward, the coordinator may use `sealed_results.py expire` to atomically fill
+one still-empty arm with a typed infrastructure-failure result. Expiration is
+rejected before the deadline, for legacy contracts without a deadline, or when
+the arm already submitted. Once the pair is complete, reveal returns the real
+model result and infrastructure record together without turning provider
+availability into a model-quality verdict.
 
 This same-user “capability sealing” is procedural, not an adversarial operating
 system boundary. Result paths are separate and hidden through the helper's

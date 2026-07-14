@@ -148,8 +148,12 @@ python3 scripts/spawn_subscription_fleet.py \
   --repo /absolute/path/to/repo \
   --project feature-ab \
   --mirrored \
-  --task-file /absolute/path/to/task.md
+  --task-file /absolute/path/to/task.md \
+  --timeout-minutes 20
 ```
+
+`--timeout-minutes` is optional and defaults to `20`. The launcher writes the
+resulting UTC deadline into the task envelope and sealed-results contract.
 
 The envelope binds the task to repository HEAD, the tracked staged+unstaged
 binary diff, and an ordered untracked path/type/mode/content-or-symlink-target
@@ -186,6 +190,23 @@ Reveal is fail-closed until both submissions exist:
 python3 scripts/sealed_results.py reveal --root "$SEALED_ROOT"
 ```
 
+If one arm is still missing after the contract deadline, seal a typed
+infrastructure failure into that arm's empty slot:
+
+```bash
+python3 scripts/sealed_results.py expire \
+  --root "$SEALED_ROOT" \
+  --team claude \
+  --reason-code provider_subscription_limit \
+  --message "Weekly subscription limit prevented completion before deadline"
+```
+
+`expire` refuses to run before the stored deadline, refuses contracts without a
+deadline, and cannot replace an existing submission. Model submissions at or
+after the deadline are rejected. After expiration, `status` is ready and
+`reveal` returns the real result beside a typed `infrastructure_failure`; that is
+an adjudication record, not a model loss.
+
 ### Four-workspace topology barrier
 
 The mirrored launcher now places both team workspaces and both orchestrator
@@ -199,8 +220,9 @@ written with `valid: false`, the error, and rollback evidence. This is a
 **topology readiness** guarantee. It does not prove that every model child has
 finished CLI onboarding, authenticated, or started reasoning after gate release.
 
-Remediation tests currently pass `15/15` across sealed publication, trust
-configuration, topology verification, barrier release, and scoped rollback.
+Remediation tests currently pass `19/19` across sealed publication, deadline
+expiration, late-submit rejection, trust configuration, topology verification,
+barrier release, and scoped rollback.
 
 The exact envelope, submission, and scoring contracts are in
 [MIRRORED-AB-PROTOCOL.md](MIRRORED-AB-PROTOCOL.md).
@@ -225,8 +247,7 @@ are specified in [ENDPOINTS.md](ENDPOINTS.md).
 
 - post-release child readiness/health checks;
 - a hard read-only boundary for controller roles (currently prompt-enforced);
-- deadline/timeout semantics in paired-result adjudication; and
-- one fresh clean mirrored rerun with no operator salvage.
+- one fresh clean mirrored rerun after the Claude subscription reset.
 
 ## Verified cmux 0.64.17 caveat on this host
 
