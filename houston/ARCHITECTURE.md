@@ -33,10 +33,16 @@ keeps both mirrored arms reproducible.
 
 - Codex workers launch with the `read-only` sandbox and approval policy `never`.
 - Claude workers launch in `plan` permission mode.
-- The lead and primary orchestrator are told not to edit the checkout. They need
-  cmux socket access so their boundary is a role contract, while the worker
-  boundary is enforced by each CLI.
+- Every run-owned surface command, including leads and primary orchestrators,
+  runs under a macOS Seatbelt profile that denies writes below the target
+  repository for that entire process tree. When this lab is itself the target,
+  only its `.team` control state is exempted.
 - No `.env` file or provider key is injected into any workspace.
+
+This process boundary does not cover raw CMUX commands or other processes
+launched separately by the same macOS user. It prevents accidental target
+mutation by the supervised fleet; it is not hostile-model isolation or a
+run-scoped CMUX authorization broker.
 
 This is the right first mode for BigBounce truth audits: independent derivation,
 literature/context inspection, adversarial review, and synthesis can happen in
@@ -116,15 +122,26 @@ result.
 Both teams and both orchestrators are created with every terminal command
 waiting behind one run-specific gate. The launcher verifies the four-workspace
 cmux topology—run-owned refs, expected titles, and expected terminal surfaces—
-before atomically releasing that gate. On any creation or verification failure,
-it keeps the gate closed, rolls back only refs created by the current run, and
-persists an invalid receipt with rollback evidence.
+before publishing the gate with atomic no-replace semantics. Gate collisions
+fail closed instead of replacing another run's release record.
 
-This barrier proves topology readiness, not child readiness. A released gate
-does not show that each Codex/Claude process has completed onboarding,
-authenticated, or begun reasoning. Post-release child health, controller
-read-only enforcement, and a fresh clean post-reset mirrored rerun remain open
-acceptance work. The focused remediation suite is currently `19/19` passing.
+After release, one supervisor per expected surface performs provider-auth
+preflight, starts the provider in a dedicated process group, verifies short
+liveness, and publishes an immutable receipt bound to run, team, role,
+workspace ref, surface ref, and repository snapshot. The launcher waits up to
+`--readiness-timeout-seconds` (default `30`) for every receipt, then watches a
+`--readiness-settle-seconds` window (default `1.0`) for immediate exit markers.
+This proves provider authentication, short process liveness, and survival of
+that early-exit window. It does **not** prove a completed model turn, usable
+provider quota, or successful reasoning.
+
+On any launch or readiness failure, the coordinator atomically invalidates the
+sealed-results contract before rollback. Invalidated runs cannot submit,
+expire, or reveal results, even if a late writer races publication. Supervisors
+observe invalidation and send TERM, then KILL if necessary, to their entire
+provider process group. Run-owned workspaces are closed in reverse order;
+failed closes remain explicit in the invalid receipt. The focused suite is
+currently `28/28` passing.
 
 ### Deadline adjudication
 
@@ -137,9 +154,11 @@ the arm already submitted. Once the pair is complete, reveal returns the real
 model result and infrastructure record together without turning provider
 availability into a model-quality verdict.
 
-This same-user “capability sealing” is procedural, not an adversarial operating
-system boundary. Result paths are separate and hidden through the helper's
-normal interface, but they are not private from another same-user process.
+Each orchestrator receives its capability through its own mode-`0400` token
+file, not an argv value. The envelope, receipt, and process listing therefore do
+not expose plaintext tokens. This same-user “capability sealing” is procedural,
+not an adversarial operating system boundary. Result paths and token files are
+not private from another process owned by the same user.
 Sessions owned by the same macOS user can potentially read the other arm's
 files, processes, cmux surfaces, or You.md messages if prompted to do so. The
 protocol prevents accidental leakage and produces an auditable run;

@@ -149,11 +149,15 @@ python3 scripts/spawn_subscription_fleet.py \
   --project feature-ab \
   --mirrored \
   --task-file /absolute/path/to/task.md \
-  --timeout-minutes 20
+  --timeout-minutes 20 \
+  --readiness-timeout-seconds 30 \
+  --readiness-settle-seconds 1.0
 ```
 
-`--timeout-minutes` is optional and defaults to `20`. The launcher writes the
-resulting UTC deadline into the task envelope and sealed-results contract.
+All three timing flags are optional. `--timeout-minutes` defaults to `20` and
+sets the result deadline; `--readiness-timeout-seconds` defaults to `30` for
+collecting every child receipt; `--readiness-settle-seconds` defaults to `1.0`
+for detecting immediate post-receipt exits.
 
 The envelope binds the task to repository HEAD, the tracked staged+unstaged
 binary diff, and an ordered untracked path/type/mode/content-or-symlink-target
@@ -173,8 +177,9 @@ prompts, then wait for their own orchestrator/lead to dispatch the task. Do not
 depend on outside-terminal `send` for initial orchestrator delivery. Each
 orchestrator prepares a JSON payload and submits it through
 `scripts/sealed_results.py submit`; it must not write directly into the sealed
-root. Plaintext capability tokens are injected only into their owning startup
-commands. The shared task envelope and spawn receipt do not contain them.
+root. Each plaintext capability is stored in its owning mode-`0400` token file
+and passed with `--token-file`; it is never placed in argv. The shared task
+envelope and spawn receipt contain only capability hashes.
 
 Copy the nested `sealed_results.root` path printed by the launcher, then observe
 without revealing payloads:
@@ -212,17 +217,29 @@ an adjudication record, not a model loss.
 The mirrored launcher now places both team workspaces and both orchestrator
 workspaces behind one shared filesystem gate. No agent command starts until
 cmux reports all four expected workspace refs, names, and terminal surface
-topologies. The launcher then releases the gate atomically.
+topologies. The launcher publishes the gate atomically without replacement.
 
-If creation or topology verification fails, the gate stays closed, only refs
-created by that run are closed in reverse order, and the spawn receipt is
-written with `valid: false`, the error, and rollback evidence. This is a
-**topology readiness** guarantee. It does not prove that every model child has
-finished CLI onboarding, authenticated, or started reasoning after gate release.
+Every released surface then authenticates through its subscription CLI, starts
+under a supervisor, survives a short liveness check, and writes an immutable
+receipt bound to run, team, role, workspace ref, surface ref, and repository
+snapshot. The launcher requires all receipts within the readiness timeout and
+then rejects exit markers during the settle window. This is not completed-turn
+readiness: an authenticated, live CLI may still be blocked by quota or fail its
+first model turn.
 
-Remediation tests currently pass `19/19` across sealed publication, deadline
-expiration, late-submit rejection, trust configuration, topology verification,
-barrier release, and scoped rollback.
+Every run-owned surface process tree is wrapped in macOS Seatbelt and denied
+target-repository writes. Raw CMUX surfaces and separately launched same-user
+processes remain outside that boundary.
+
+On creation, topology, or readiness failure, the launcher atomically invalidates
+the sealed contract before closing run-owned workspaces in reverse order.
+Supervisors monitor invalidation and TERM/KILL their complete process groups.
+The invalid receipt records every failed close; invalidated contracts cannot
+submit, expire, or reveal a raced late result.
+
+Remediation tests currently pass `28/28` across sealing, invalidation races,
+trust, Seatbelt enforcement, topology, bound readiness, early-exit settlement,
+process-group termination, no-replace gate release, and scoped rollback.
 
 The exact envelope, submission, and scoring contracts are in
 [MIRRORED-AB-PROTOCOL.md](MIRRORED-AB-PROTOCOL.md).
@@ -245,8 +262,8 @@ are specified in [ENDPOINTS.md](ENDPOINTS.md).
 
 ## Remaining acceptance blockers
 
-- post-release child readiness/health checks;
-- a hard read-only boundary for controller roles (currently prompt-enforced);
+- provider completed-turn readiness, including quota availability;
+- a run-scoped CMUX broker or stronger hostile-model isolation;
 - one fresh clean mirrored rerun after the Claude subscription reset.
 
 ## Verified cmux 0.64.17 caveat on this host

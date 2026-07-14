@@ -99,6 +99,17 @@ recompute the envelope and repository snapshot, emit `CMUX_RESULT_INVALID` on a
 mismatch, and stop before work. Workers report only to their own lead; each
 orchestrator talks only to its own lead.
 
+Every run-owned surface command is wrapped in a macOS Seatbelt profile that
+denies target-repository writes for its complete process tree. Raw CMUX surfaces
+and separately launched same-user processes are outside this boundary.
+
+After the no-replace topology gate releases, supervisors perform provider-auth
+preflight and short liveness checks. Each immutable readiness receipt binds the
+run, team, role, workspace ref, surface ref, and target snapshot. All receipts
+must arrive within `--readiness-timeout-seconds 30`, then survive the
+`--readiness-settle-seconds 1.0` early-exit window. This does not prove a
+completed model turn or available provider quota.
+
 ## 4. Seal results before reveal
 
 Each orchestrator writes a canonical JSON payload outside the sealed root, then
@@ -106,15 +117,16 @@ submits it exactly once through the helper. The injected startup instruction is
 equivalent to:
 
 ```bash
-SEALED_RESULTS_TOKEN="$TEAM_TOKEN" \
-  python3 scripts/sealed_results.py submit \
-  --root "$SEALED_ROOT" --team codex --input /tmp/codex-result.json
+python3 scripts/sealed_results.py submit \
+  --root "$SEALED_ROOT" --team codex \
+  --token-file "$SEALED_ROOT/capabilities/codex" \
+  --input /tmp/codex-result.json
 ```
 
-The Claude arm substitutes `--team claude`. Plaintext capabilities are injected
-only into their owning orchestrator startup commands; the task envelope and
-spawn receipt contain no plaintext tokens, and the helper contract persists
-only capability hashes.
+The Claude arm substitutes `claude` in the team and token-file path. Plaintext
+capabilities live only in per-team mode-`0400` files, never argv. The task
+envelope and spawn receipt contain no plaintext tokens, and the helper contract
+persists only capability hashes.
 
 The coordinator checks receipts without payloads:
 
@@ -129,6 +141,12 @@ python3 scripts/sealed_results.py reveal --root "$SEALED_ROOT"
 ```
 
 Before that point, summaries, progress comparisons, and scores remain withheld.
+If launch or readiness fails, the coordinator atomically invalidates the seal
+before rollback. Invalidation dominates late submission races: status remains
+`valid: false`, while submit, expire, and reveal fail closed. Supervisors observe
+the marker and TERM/KILL their whole provider process group; failed workspace
+closes remain in the invalid receipt.
+
 For new contracts, `--timeout-minutes` defaults to `20`. At or after the stored
 deadline, expire one missing arm with a typed infrastructure result:
 
@@ -165,11 +183,10 @@ majority vote, or speed alone.
 ## Capability-sealing limit
 
 This protocol's sealing is procedural. Result files are write-once/read-only
-through the helper's contract, but their paths are not private from processes
+and capabilities are mode-`0400`, but their paths are not private from processes
 owned by the same macOS user. Such sessions may technically inspect sibling
-files, processes, cmux surfaces, or You.md messages. Prompts, separate paths,
-hashed capabilities, and delayed reveal prevent ordinary contamination, but
-they are not an adversarial OS security boundary. For hostile or publish-grade
-blind evaluation, use separate OS accounts or VMs/containers with enforced
-mount/network rules, or a server-side service that atomically stores tokens and
-releases both payloads together.
+files, processes, cmux surfaces, or You.md messages. Seatbelt constrains the
+launcher-owned surface trees; it does not govern raw CMUX or other same-user
+processes. For hostile or publish-grade blind evaluation, use a run-scoped CMUX
+broker plus separate OS accounts or VMs/containers with enforced mount/network
+rules, or a server-side blind evaluation service.

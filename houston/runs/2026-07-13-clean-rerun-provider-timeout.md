@@ -98,12 +98,30 @@ python3 scripts/sealed_results.py expire \
 The helper rejects early expiration, expiration without a contract deadline,
 replacement of an existing result, and late model submission. Expiration seals
 a typed `infrastructure_failure`, allowing paired reveal without declaring a
-model loss. Focused coverage is now `19/19` passing.
+model loss. Deadline-focused coverage reached `19/19` at that remediation
+checkpoint.
+
+## Launch hardening added after this run
+
+Subsequent commits `e2e2496` and `ec6f48e` add fail-closed launch supervision;
+they do not alter this historical run or reveal its Codex result. Every
+run-owned surface process tree is now Seatbelt-denied target writes, while raw
+CMUX and separately launched same-user processes remain outside the boundary.
+The topology gate uses atomic no-replace publication.
+
+Supervisors perform provider-auth preflight, short liveness validation, and a
+one-second early-exit settle. Their immutable receipts bind run, team, role,
+workspace, surface, and snapshot. This still does not prove a completed model
+turn or provider quota availability. Failed launch/readiness atomically
+invalidates the sealed contract before rollback; supervisors then TERM/KILL the
+full process group, and receipts retain any workspace-close failures.
+Capabilities now use per-team mode-`0400` token files instead of argv values.
+The combined focused suite is `28/28` passing.
 
 ## Remaining blockers
 
-- post-release child health/readiness beyond topology and Codex trust;
-- a hard read-only boundary for controller roles, which remain prompt-enforced;
+- provider completed-turn readiness, including quota availability;
+- a run-scoped CMUX broker or stronger hostile-model isolation;
 - a fresh clean mirrored rerun after the Claude subscription reset.
 
 The security boundary remains procedural/capability isolation only. It prevents
