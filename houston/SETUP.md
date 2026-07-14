@@ -186,6 +186,22 @@ Reveal is fail-closed until both submissions exist:
 python3 scripts/sealed_results.py reveal --root "$SEALED_ROOT"
 ```
 
+### Four-workspace topology barrier
+
+The mirrored launcher now places both team workspaces and both orchestrator
+workspaces behind one shared filesystem gate. No agent command starts until
+cmux reports all four expected workspace refs, names, and terminal surface
+topologies. The launcher then releases the gate atomically.
+
+If creation or topology verification fails, the gate stays closed, only refs
+created by that run are closed in reverse order, and the spawn receipt is
+written with `valid: false`, the error, and rollback evidence. This is a
+**topology readiness** guarantee. It does not prove that every model child has
+finished CLI onboarding, authenticated, or started reasoning after gate release.
+
+Remediation tests currently pass `15/15` across sealed publication, trust
+configuration, topology verification, barrier release, and scoped rollback.
+
 The exact envelope, submission, and scoring contracts are in
 [MIRRORED-AB-PROTOCOL.md](MIRRORED-AB-PROTOCOL.md).
 
@@ -204,6 +220,13 @@ It exits before creating sessions or worktrees. The current You.md agent bus
 provides durable coordination messages, not a server-atomic compare-and-set
 lease. The atomic API and isolated-worktree rollout needed to enable mutation
 are specified in [ENDPOINTS.md](ENDPOINTS.md).
+
+## Remaining acceptance blockers
+
+- post-release child readiness/health checks;
+- a hard read-only boundary for controller roles (currently prompt-enforced);
+- deadline/timeout semantics in paired-result adjudication; and
+- one fresh clean mirrored rerun with no operator salvage.
 
 ## Verified cmux 0.64.17 caveat on this host
 

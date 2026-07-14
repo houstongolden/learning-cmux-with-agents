@@ -111,6 +111,22 @@ procedurally forbidden from inspecting the other's plan, transcript, status
 detail, payload, elapsed progress, or preliminary score before it seals its own
 result.
 
+### Transactional topology release
+
+Both teams and both orchestrators are created with every terminal command
+waiting behind one run-specific gate. The launcher verifies the four-workspace
+cmux topology—run-owned refs, expected titles, and expected terminal surfaces—
+before atomically releasing that gate. On any creation or verification failure,
+it keeps the gate closed, rolls back only refs created by the current run, and
+persists an invalid receipt with rollback evidence.
+
+This barrier proves topology readiness, not child readiness. A released gate
+does not show that each Codex/Claude process has completed onboarding,
+authenticated, or begun reasoning. Post-release child health, controller
+read-only enforcement, paired deadline/timeout adjudication, and a fresh clean
+mirrored rerun remain open acceptance work. The focused remediation suite is
+currently `15/15` passing.
+
 This same-user “capability sealing” is procedural, not an adversarial operating
 system boundary. Result paths are separate and hidden through the helper's
 normal interface, but they are not private from another same-user process.
