@@ -42,8 +42,11 @@ dispatch. Events are secondary telemetry, not the source of task truth.
 | OpenAI / ChatGPT | `codex login`, `codex login status` | `codex --model ... --config model_reasoning_effort=...` |
 | Anthropic / Claude.ai | `claude auth login`, `claude auth status` | `claude --model ... --effort ...` |
 
-No provider REST endpoint is called by this package and no provider API key is
-loaded by the launcher.
+These are local CLI subscription routes, not usage-billed provider API routes.
+No provider REST endpoint is called directly by this package and no provider
+API key is loaded or injected by the launcher. Spawn receipts declare
+`provider_authentication.mode = cli_subscription` and separately record that
+the launcher made no direct usage-billed API request.
 
 ## You.md CLI and API surfaces (available in v0.10.0)
 

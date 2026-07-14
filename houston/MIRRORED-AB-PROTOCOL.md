@@ -2,10 +2,11 @@
 
 ## Purpose
 
-Compare Codex `gpt-5.6-sol` high against Claude `claude-opus-4-8` high without
+Compare Codex `gpt-5.6-sol` high against Claude `claude-fable-5` high without
 letting different workers, repository state, prompt delivery, or early result
 visibility decide the outcome. This protocol is read-only by default and uses
-existing ChatGPT and Claude.ai subscription logins only.
+existing ChatGPT and Claude.ai subscription logins only. Claude is the optional
+independent comparison director, not a routine worker route.
 
 ## 1. Freeze one immutable task envelope
 
@@ -117,6 +118,12 @@ sentinel, sentinel plus one LF, or sentinel plus one CRLF. Raw output is
 deleted; the exclusive immutable receipt stores only hashes binding the run, route,
 repository snapshot, command, executable content, and sentinel plus the UTC
 completion time. Identical routes are probed once.
+
+The same API-key/routing-variable scrub wraps every interactive surface command,
+so an inherited `OPENAI_API_KEY` cannot silently move Codex onto separate API
+billing. The spawn receipt records `provider_authentication.mode` as
+`cli_subscription` and states that the launcher made no direct usage-billed API
+request.
 
 Any route timeout, nonzero exit, provider error, invalid output, or sentinel
 mismatch invalidates the sealed-results contract before release and leaves zero

@@ -79,7 +79,24 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
             self.assertEqual(parts[1], "-p")
             self.assertIn(str(self.repo.resolve()), parts[2])
             parts = shlex.split(parts[-1])
+        if Path(parts[0]).name == "env":
+            index = 1
+            while index < len(parts) and parts[index] == "-u":
+                index += 2
+            parts = parts[index:]
         return parts
+
+    def _assert_api_credentials_scrubbed(self, value: str) -> None:
+        parts = shlex.split(value)
+        if Path(parts[0]).name == "sandbox-exec":
+            parts = shlex.split(parts[-1])
+        self.assertEqual(parts[0], "/usr/bin/env")
+        unset: set[str] = set()
+        index = 1
+        while index < len(parts) and parts[index] == "-u":
+            unset.add(parts[index + 1])
+            index += 2
+        self.assertEqual(unset, fleet.PROBE_ENV_DENYLIST)
 
     def _assert_surface_guarded(self, value: str) -> None:
         parts = shlex.split(value)
@@ -91,7 +108,11 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
         binary = Path(parts[0]).name
         model = parts[parts.index("--model") + 1]
         if binary == "codex":
-            effort = parts[parts.index("-c") + 1]
+            effort = next(
+                parts[index + 1]
+                for index, part in enumerate(parts[:-1])
+                if part == "-c" and parts[index + 1].startswith("model_reasoning_effort=")
+            )
             policy = parts[parts.index("--sandbox") + 1]
         else:
             effort = parts[parts.index("--effort") + 1]
@@ -111,14 +132,14 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
         config_values = [parts[index + 1] for index, part in enumerate(parts[:-1]) if part == "-c"]
         expected = f'projects.{json.dumps(str(self.repo.resolve()))}.trust_level="trusted"'
         self.assertIn(expected, config_values)
-        self.assertNotIn("OPENAI_API_KEY", value)
+        self._assert_api_credentials_scrubbed(value)
 
     def _assert_claude_unchanged(self, value: str) -> None:
         parts = self._provider_parts(value)
         self.assertEqual(Path(parts[0]).name, "claude")
         self.assertNotIn("-C", parts)
         self.assertFalse(any("trust_level" in part for part in parts))
-        self.assertNotIn("ANTHROPIC_API_KEY", value)
+        self._assert_api_credentials_scrubbed(value)
 
     @staticmethod
     def _launch_layout(*names: str) -> dict:
@@ -253,6 +274,16 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
                     plan["envelope"]["sealed_results"]["deadline_utc"],
                 )
                 self.assertFalse(plan["provider_api_keys_injected"])
+                self.assertEqual(
+                    plan["provider_authentication"],
+                    fleet.provider_authentication_receipt(),
+                )
+                self.assertEqual(plan["provider_authentication"]["mode"], "cli_subscription")
+                self.assertFalse(
+                    plan["provider_authentication"][
+                        "direct_usage_billed_api_requests_by_launcher"
+                    ]
+                )
 
                 codex_orchestrator = plan["orchestrator_layouts"]["codex"]["pane"]["surfaces"][0]["command"]
                 claude_orchestrator = plan["orchestrator_layouts"]["claude"]["pane"]["surfaces"][0]["command"]
@@ -337,14 +368,86 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
         self.assertEqual(
             routes,
             [
-                {"provider": "codex", "model": "gpt-5.6-sol", "effort": "medium"},
-                {"provider": "codex", "model": "gpt-5.6-sol", "effort": "low"},
-                {"provider": "claude", "model": "sonnet", "effort": "medium"},
+                {"provider": "codex", "model": "gpt-5.6-terra", "effort": "medium"},
+                {"provider": "codex", "model": "gpt-5.6-luna", "effort": "medium"},
+                {"provider": "codex", "model": "gpt-5.3-codex-spark", "effort": "low"},
                 {"provider": "codex", "model": "gpt-5.6-sol", "effort": "high"},
-                {"provider": "claude", "model": "claude-opus-4-8", "effort": "high"},
+                {"provider": "claude", "model": "claude-fable-5", "effort": "high"},
             ],
         )
         self.assertEqual(plan["provider_route_readiness"]["timeout_seconds"], 60)
+
+    def test_default_role_routing_is_subscription_first_and_tiered(self) -> None:
+        result = self._run(
+            "--repo",
+            str(self.repo),
+            "--project",
+            self.project,
+            "--orchestrator",
+            "both",
+            "--dry-run",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        expected = {
+            "__LEAD_COMMAND__": (
+                "codex",
+                "gpt-5.6-terra",
+                'model_reasoning_effort="medium"',
+                "danger-full-access",
+            ),
+            "__EXPLORER_COMMAND__": (
+                "codex",
+                "gpt-5.6-luna",
+                'model_reasoning_effort="medium"',
+                "read-only",
+            ),
+            "__REVIEWER_COMMAND__": (
+                "codex",
+                "gpt-5.6-luna",
+                'model_reasoning_effort="medium"',
+                "read-only",
+            ),
+            "__TESTER_COMMAND__": (
+                "codex",
+                "gpt-5.3-codex-spark",
+                'model_reasoning_effort="low"',
+                "read-only",
+            ),
+            "__COMPARATOR_COMMAND__": (
+                "codex",
+                "gpt-5.6-luna",
+                'model_reasoning_effort="medium"',
+                "read-only",
+            ),
+        }
+        self.assertEqual(
+            {role: self._command_topology(value) for role, value in plan["commands"].items()},
+            expected,
+        )
+
+        args = fleet.parser().parse_args([])
+        codex_director = fleet.orchestrator_layout(
+            args, self.repo, self.project, "codex"
+        )["pane"]["surfaces"][0]["command"]
+        claude_director = fleet.orchestrator_layout(
+            args, self.repo, self.project, "claude"
+        )["pane"]["surfaces"][0]["command"]
+        self.assertEqual(
+            self._command_topology(codex_director),
+            (
+                "codex",
+                "gpt-5.6-sol",
+                'model_reasoning_effort="high"',
+                "danger-full-access",
+            ),
+        )
+        self.assertEqual(
+            self._command_topology(claude_director),
+            ("claude", "claude-fable-5", "high", "auto"),
+        )
+        for value in plan["commands"].values():
+            self._assert_api_credentials_scrubbed(value)
 
     def test_provider_probe_commands_are_isolated_and_disable_api_key_env(self) -> None:
         cwd = self.base / "empty"
@@ -678,6 +781,7 @@ class SpawnSubscriptionFleetTests(unittest.TestCase):
         self.assertIn("layout", plan)
         self.assertIn("commands", plan)
         self.assertFalse(plan["provider_api_keys_injected"])
+        self.assertEqual(plan["provider_authentication"], fleet.provider_authentication_receipt())
         for value in plan["commands"].values():
             self._assert_surface_guarded(value)
             if Path(self._provider_parts(value)[0]).name == "codex":

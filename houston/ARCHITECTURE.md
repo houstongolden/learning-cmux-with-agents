@@ -142,6 +142,10 @@ response is deleted; an immutable receipt retains only hashes of the run, route 
 command, executable content, and sentinel plus its UTC completion time.
 Duplicate routes are probed once.
 
+Interactive surface commands use the same credential/routing-variable scrub.
+Receipts identify this as local CLI subscription authentication and explicitly
+distinguish it from a direct usage-billed provider API request.
+
 Only after every route receipt validates does CMUX creation begin. After the
 topology gate releases, one supervisor per expected surface performs
 provider-auth preflight, starts the provider in a dedicated process group,

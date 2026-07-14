@@ -2,7 +2,9 @@
 
 This additive package turns the upstream five-pane cmux pattern into a local
 Codex + Claude Code lab that uses existing ChatGPT and Claude.ai logins. It does
-not load `.env`, require provider API keys, or change upstream files.
+not load `.env`, require provider API keys, make direct usage-billed provider
+API requests, or change upstream files. Codex and Claude Code authenticate via
+their local subscription CLIs; that is distinct from API billing.
 
 The default single-arm topology is:
 
@@ -11,9 +13,9 @@ primary orchestrator: Codex / gpt-5.6-sol / high (inside cmux)
                                 |
                                 v
 +-------------------------------+-------------------------------+
-| lead: Codex / gpt-5.6-sol     | explorer | reviewer          |
+| lead: Codex / gpt-5.6-terra   | Luna     | Luna              |
 |                               |----------+-------------------|
-| drives the four named panes   | tester   | comparator        |
+| drives the four named panes   | Spark    | Luna              |
 +-------------------------------+-------------------------------+
 ```
 
@@ -39,7 +41,8 @@ python3 scripts/spawn_subscription_fleet.py \
 
 The live command boots commands declaratively inside cmux. Use
 `--orchestrator none` to create only the team, or `--orchestrator claude` to run
-the comparison orchestrator with Claude Opus 4.8 at high effort.
+the independent comparison/checkpoint director with Claude Fable 5 at high
+effort. Claude is not used for routine worker panes.
 
 For a real Codex-versus-Claude comparison, do not point two orchestrators at one
 already-active lead. Create mirrored A and B arms from one immutable task

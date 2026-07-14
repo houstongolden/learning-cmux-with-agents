@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Boot a subscription-authenticated Codex/Claude fleet in cmux.
+"""Boot a subscription-authenticated Codex fleet in cmux.
 
 The launcher intentionally uses declarative cmux layouts. It never reads an
-.env file or injects provider API keys. Mutation mode is reserved until You.md
-ships an atomic work-claim lease; the current agent bus is not a lock.
+.env file, injects provider API keys, or calls a provider's usage-billed API.
+Claude is reserved for an optional independent comparison director. Mutation
+mode is reserved until You.md ships an atomic work-claim lease; the current
+agent bus is not a lock.
 """
 
 from __future__ import annotations
@@ -50,6 +52,11 @@ READINESS_BOUNDARY = (
     "for one CMUX surface; it does not prove a completed model turn. It is not protection "
     "against a malicious same-user process."
 )
+PROVIDER_AUTH_BOUNDARY = (
+    "Routes launch the local Codex or Claude Code CLI with its existing subscription "
+    "login. The launcher does not load .env, inject provider API keys, set alternate "
+    "provider base URLs, or make direct usage-billed provider API requests."
+)
 READINESS_SCHEMA_VERSION = 1
 ROUTE_PROBE_SCHEMA_VERSION = 1
 ROUTE_PROBE_RECEIPT_KEYS = {
@@ -71,6 +78,10 @@ PROBE_ENV_DENYLIST = {
     "CODEX_API_KEY",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
+    "OPENROUTER_API_KEY",
+    "XAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
     "OPENAI_BASE_URL",
     "ANTHROPIC_BASE_URL",
     "CLAUDE_CODE_USE_BEDROCK",
@@ -139,6 +150,26 @@ def sha256(value: bytes | str) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def provider_authentication_receipt() -> dict[str, object]:
+    """Describe the billing/auth rail without exposing a credential."""
+
+    return {
+        "mode": "cli_subscription",
+        "direct_usage_billed_api_requests_by_launcher": False,
+        "provider_api_keys_injected": False,
+        "boundary": PROVIDER_AUTH_BOUNDARY,
+    }
+
+
+def subscription_cli_command(parts: list[str]) -> list[str]:
+    """Strip API/routing credentials before entering a subscription CLI."""
+
+    scrubbed = ["/usr/bin/env"]
+    for name in sorted(PROBE_ENV_DENYLIST):
+        scrubbed.extend(("-u", name))
+    return [*scrubbed, *parts]
+
+
 def positive_minutes(value: str) -> int:
     try:
         minutes = int(value)
@@ -200,22 +231,24 @@ def codex_cmd(
     repo = repo.resolve()
     trust_override = f'projects.{json.dumps(str(repo))}.trust_level="trusted"'
     launched = command(
-        [
-            "codex",
-            "-C",
-            str(repo),
-            "-c",
-            trust_override,
-            "--model",
-            model,
-            "-c",
-            f'model_reasoning_effort="{effort}"',
-            "--sandbox",
-            "danger-full-access" if controller else "read-only",
-            "--ask-for-approval",
-            "never",
-            prompt,
-        ]
+        subscription_cli_command(
+            [
+                "codex",
+                "-C",
+                str(repo),
+                "-c",
+                trust_override,
+                "--model",
+                model,
+                "-c",
+                f'model_reasoning_effort="{effort}"',
+                "--sandbox",
+                "danger-full-access" if controller else "read-only",
+                "--ask-for-approval",
+                "never",
+                prompt,
+            ]
+        )
     )
     return surface_guard(launched, repo)
 
@@ -229,16 +262,18 @@ def claude_cmd(
     repo: Path,
 ) -> str:
     launched = command(
-        [
-            "claude",
-            "--model",
-            model,
-            "--effort",
-            effort,
-            "--permission-mode",
-            "auto" if controller else "plan",
-            prompt,
-        ]
+        subscription_cli_command(
+            [
+                "claude",
+                "--model",
+                model,
+                "--effort",
+                effort,
+                "--permission-mode",
+                "auto" if controller else "plan",
+                prompt,
+            ]
+        )
     )
     return surface_guard(launched, repo)
 
@@ -312,16 +347,16 @@ def render_team(
             args.codex_lead_model, "medium", prompts["lead"], controller=True, repo=repo
         ),
         "__EXPLORER_COMMAND__": codex_cmd(
-            args.codex_worker_model, "low", prompts["explorer"], controller=False, repo=repo
+            args.codex_worker_model, "medium", prompts["explorer"], controller=False, repo=repo
         ),
-        "__REVIEWER_COMMAND__": claude_cmd(
-            args.claude_worker_model, "medium", prompts["reviewer"], controller=False, repo=repo
+        "__REVIEWER_COMMAND__": codex_cmd(
+            args.codex_worker_model, "medium", prompts["reviewer"], controller=False, repo=repo
         ),
         "__TESTER_COMMAND__": codex_cmd(
-            args.codex_worker_model, "low", prompts["tester"], controller=False, repo=repo
+            args.codex_tester_model, "low", prompts["tester"], controller=False, repo=repo
         ),
-        "__COMPARATOR_COMMAND__": claude_cmd(
-            args.claude_worker_model, "medium", prompts["comparator"], controller=False, repo=repo
+        "__COMPARATOR_COMMAND__": codex_cmd(
+            args.codex_worker_model, "medium", prompts["comparator"], controller=False, repo=repo
         ),
     }
     layout = json.loads(TEMPLATE.read_text())
@@ -425,8 +460,8 @@ def provider_routes(args: argparse.Namespace) -> list[dict[str, str]]:
 
     candidates = (
         ("codex", args.codex_lead_model, "medium"),
-        ("codex", args.codex_worker_model, "low"),
-        ("claude", args.claude_worker_model, "medium"),
+        ("codex", args.codex_worker_model, "medium"),
+        ("codex", args.codex_tester_model, "low"),
         ("codex", args.codex_orchestrator_model, "high"),
         ("claude", args.claude_orchestrator_model, "high"),
     )
@@ -692,6 +727,11 @@ def command_provider(value: str) -> str:
     parts = shlex.split(value)
     if Path(parts[0]).name == "sandbox-exec":
         parts = shlex.split(parts[-1])
+    if Path(parts[0]).name == "env":
+        index = 1
+        while index < len(parts) and parts[index] == "-u":
+            index += 2
+        parts = parts[index:]
     provider = Path(parts[0]).name
     if provider not in {"codex", "claude"}:
         raise MirroredLaunchError(f"unsupported child provider command: {provider}")
@@ -1574,10 +1614,10 @@ def parser() -> argparse.ArgumentParser:
         help="bounded wait for each subscription-backed provider route turn (default: 60)",
     )
     p.add_argument("--codex-orchestrator-model", default="gpt-5.6-sol")
-    p.add_argument("--claude-orchestrator-model", default="claude-opus-4-8")
-    p.add_argument("--codex-lead-model", default="gpt-5.6-sol")
-    p.add_argument("--codex-worker-model", default="gpt-5.6-sol")
-    p.add_argument("--claude-worker-model", default="sonnet")
+    p.add_argument("--claude-orchestrator-model", default="claude-fable-5")
+    p.add_argument("--codex-lead-model", default="gpt-5.6-terra")
+    p.add_argument("--codex-worker-model", default="gpt-5.6-luna")
+    p.add_argument("--codex-tester-model", default="gpt-5.3-codex-spark")
     p.add_argument("--validate", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     return p
@@ -1867,13 +1907,14 @@ def main() -> None:
             },
             "models": {
                 "lead": args.codex_lead_model,
-                "codex_workers": args.codex_worker_model,
-                "claude_workers": args.claude_worker_model,
+                "workers": args.codex_worker_model,
+                "tester": args.codex_tester_model,
             },
             "layouts": layouts,
             "orchestrator_layouts": primary_layouts,
             "commands": team_commands,
             "provider_api_keys_injected": False,
+            "provider_authentication": provider_authentication_receipt(),
             "surface_read_only_boundary": SURFACE_READ_ONLY_BOUNDARY,
         }
         if args.dry_run:
@@ -1897,6 +1938,7 @@ def main() -> None:
             "readiness_timeout_seconds": args.readiness_timeout_seconds,
             "readiness_settle_seconds": args.readiness_settle_seconds,
             "route_probe_timeout_seconds": args.route_probe_timeout_seconds,
+            "provider_authentication": provider_authentication_receipt(),
             "surface_read_only_boundary": SURFACE_READ_ONLY_BOUNDARY,
         }
         try:
@@ -1935,12 +1977,13 @@ def main() -> None:
             "orchestrator_codex": args.codex_orchestrator_model,
             "orchestrator_claude": args.claude_orchestrator_model,
             "lead": args.codex_lead_model,
-            "codex_workers": args.codex_worker_model,
-            "claude_workers": args.claude_worker_model,
+            "workers": args.codex_worker_model,
+            "tester": args.codex_tester_model,
         },
         "layout": team_layout,
         "commands": commands,
         "provider_api_keys_injected": False,
+        "provider_authentication": provider_authentication_receipt(),
         "surface_read_only_boundary": SURFACE_READ_ONLY_BOUNDARY,
     }
     if args.dry_run:
@@ -1948,7 +1991,11 @@ def main() -> None:
         return
 
     ensure_cmux()
-    receipt = {"team": create_workspace(f"{project}-team", repo, team_layout), "orchestrators": {}}
+    receipt = {
+        "team": create_workspace(f"{project}-team", repo, team_layout),
+        "orchestrators": {},
+        "provider_authentication": provider_authentication_receipt(),
+    }
     kinds = ("codex", "claude") if args.orchestrator == "both" else (args.orchestrator,)
     for kind in kinds:
         if kind != "none":

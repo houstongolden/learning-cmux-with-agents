@@ -57,9 +57,12 @@ youmd whoami
 ```
 
 The launcher deliberately does not pass `--env-file`, inspect `.env`, or read
-`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`. If a CLI chooses an API credential from
-your existing shell environment, unset it in that shell before launch so the
-interactive subscription login is authoritative.
+provider API keys. Every generated Codex/Claude command explicitly unsets known
+provider API-key and alternate-routing variables before starting the CLI, while
+preserving subscription OAuth/keychain state. Spawn receipts label this
+`cli_subscription`; the launcher makes no direct usage-billed provider API
+request. This prevents an inherited `OPENAI_API_KEY` from silently switching a
+Codex worker onto separate API billing.
 
 ### Codex project trust is per invocation
 
@@ -126,16 +129,20 @@ python3 scripts/spawn_subscription_fleet.py \
   --orchestrator claude
 ```
 
-That launches `claude --model claude-opus-4-8 --effort high`. The exact model
-IDs are flags, so account-specific aliases can be supplied without editing the
-template:
+That launches `claude --model claude-fable-5 --effort high` as an independent
+checkpoint/comparison director. Claude is not used for routine worker panes.
+The exact model IDs are flags, so account-specific aliases can be supplied
+without editing the template:
 
 ```bash
 python3 scripts/spawn_subscription_fleet.py \
   --repo /absolute/path/to/repo \
   --project feature-name \
   --codex-orchestrator-model gpt-5.6-sol \
-  --claude-orchestrator-model claude-opus-4-8
+  --codex-lead-model gpt-5.6-terra \
+  --codex-worker-model gpt-5.6-luna \
+  --codex-tester-model gpt-5.3-codex-spark \
+  --claude-orchestrator-model claude-fable-5
 ```
 
 ## 5. Run a mirrored A/B comparison
@@ -169,7 +176,7 @@ run.
 Start two fresh fleet workspaces from that same envelope:
 
 - arm A: Codex `gpt-5.6-sol`, high-effort orchestrator;
-- arm B: Claude `claude-opus-4-8`, high-effort orchestrator;
+- arm B: Claude `claude-fable-5`, high-effort orchestrator;
 - both: equivalent lead/worker prompt templates and identical models, tools,
   permissions, time budget, and acceptance commands.
 
@@ -218,11 +225,12 @@ an adjudication record, not a model loss.
 
 Before creating CMUX workspaces, the launcher completes one minimal model turn
 for each unique provider/model/effort route. These one-shot probes use the
-existing `codex login` and Claude subscription sessions. The launcher removes
-provider API-key, alternate-base-URL, Bedrock/Vertex/Foundry, and related cloud
-credential/routing variables while preserving subscription OAuth and keychain
-state. Probes run in fresh empty directories with read-only or disabled-tool
-configuration and no session persistence. Provider CLIs are resolved to
+existing `codex login` and Claude subscription sessions. Both probes and live
+surface commands remove provider API-key, alternate-base-URL,
+Bedrock/Vertex/Foundry, and related cloud credential/routing variables while
+preserving subscription OAuth and keychain state. Probes run in fresh empty
+directories with read-only or disabled-tool configuration and no session
+persistence. Provider CLIs are resolved to
 absolute paths, and their executable content digests are checked after the
 turn. The response must be the bare run-bound sentinel, sentinel plus one LF,
 or sentinel plus one CRLF. Probe output is deleted. The immutable receipt contains only hashes
